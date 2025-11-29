@@ -1,12 +1,15 @@
 require('dotenv').config();
 
 const { Telegraf, Markup } = require('telegraf');
+const express = require('express');
 const { Pool } = require('pg');
 const { randomUUID } = require('crypto');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = Number(process.env.ADMIN_ID) || 0;
 const DATABASE_URL = process.env.DATABASE_URL;
+const PORT = Number(process.env.PORT) || 3000;
+const WEBHOOK_URL = process.env.WEBHOOK_URL || process.env.RENDER_EXTERNAL_URL || null;
 
 if (!BOT_TOKEN) {
   console.error('ERROR: set BOT_TOKEN in env');
@@ -86,6 +89,7 @@ async function initDb() {
 }
 initDb().then(() => console.log('DB initialized')).catch(err => { console.error('DB init error', err); process.exit(1); });
 
+// ---------- Helpers ----------
 function escapeHtml(str) {
   if (!str && str !== 0) return '';
   return String(str).replace(/[&<>"]/g, ch => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[ch]));
@@ -115,6 +119,7 @@ function parseSlotDateTimeInterval(text) {
   if (sh < 0 || sh > 23 || eh < 0 || eh > 23) return null;
   if (sm < 0 || sm > 59 || em < 0 || em > 59) return null;
 
+  // Use UTC construction to avoid local tz surprises; Postgres timestamptz stores with timezone awareness.
   const start = new Date(Date.UTC(year, month - 1, day, sh, sm));
   const end = new Date(Date.UTC(year, month - 1, day, eh, em));
 
@@ -129,7 +134,7 @@ function intervalsOverlap(aStart, aEnd, bStart, bEnd) {
   return aStart < bEnd && bStart < aEnd;
 }
 
-// db functions
+// ---------- DB async functions ----------
 async function getAllSlots() {
   const res = await pool.query('SELECT * FROM slots ORDER BY start');
   return res.rows;
@@ -194,6 +199,7 @@ async function getHistoryForUser(userId) {
 // inmemory states for admins
 const adminStates = {}; // { <adminId>: { mode, moveReqId, choosingSlotId } }
 
+// ---------- showRequestsByStatus ----------
 async function showRequestsByStatus(ctx, status, label) {
   try {
     const list = await getRequestsByStatus(status);
@@ -224,7 +230,6 @@ async function showRequestsByStatus(ctx, status, label) {
         ]);
       } else if (status === 'move_pending') {
         kb = Markup.inlineKeyboard([
-          [Markup.button.callback('✔ Применить перенос (админ)', `applymove_${r.id}`)],
           [Markup.button.callback('❌ Отменить заявку', `reject_${r.id}`), Markup.button.callback('🚫 Неявка', `no_show_${r.id}`)]
         ]);
       } else if (status === 'rejected' || status === 'completed' || status === 'no_show') {
@@ -266,6 +271,7 @@ async function openAdminPanel(ctx) {
   try { await ctx.answerCbQuery(); } catch (_) {}
 }
 
+// ---------- Bot handlers (client/admin flows) ----------
 bot.start(async ctx => {
   try {
     const keyboard = [
@@ -298,6 +304,7 @@ bot.hears('📝 Оставить заявку', async ctx => {
   } catch (e) { console.error('start request error', e); }
 });
 
+// Choose slot -> show procedures
 bot.action(/req_([0-9a-fA-F\-]{36})/, async ctx => {
   try {
     const slotId = ctx.match[1];
@@ -322,8 +329,6 @@ bot.action(/^proc_([0-9a-fA-F\-]{36})_(.+)$/u, async ctx => {
   try {
     const slotId = ctx.match[1];
     const procKey = ctx.match[2];
-
-    console.log('proc callback:', { slotId, procKey, from: ctx.from.id });
 
     const slot = await getSlotById(slotId);
     if (!slot) return ctx.answerCbQuery('Слот стал недоступен', { show_alert: true });
@@ -386,7 +391,7 @@ bot.hears('📚 История посещений', async ctx => {
   } catch (e) { console.error('history error', e); }
 });
 
-// admin crud
+// ---------- Admin: procedures CRUD ----------
 bot.action('manage_procedures', async ctx => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('Нет доступа');
   try {
@@ -439,7 +444,7 @@ bot.on('text', async ctx => {
 
     if (st.mode === 'addslot') {
       const parsed = parseSlotDateTimeInterval(text);
-      if (!parsed) return ctx.reply('Неправильный формат или некорректная дата/время. Формат: 12.12.2025 12:30-14:30');
+      if (!parsed) return ctx.reply('Неправильный формат или некорректная дата/время. Формат: DD.MM.YYYY 00:00-23:59');
       if (isInPast(parsed.start)) return ctx.reply('Нельзя создать слот, который начинается в прошлом.');
 
       const slots = await getAllSlots();
@@ -463,6 +468,7 @@ bot.on('text', async ctx => {
   }
 });
 
+// ---------- Admin: slots add/delete ----------
 bot.action('admin_addslot', async ctx => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('Нет доступа');
   adminStates[ctx.from.id] = { mode: 'addslot' };
@@ -499,7 +505,7 @@ bot.action('req_no_show', async ctx => { if (ctx.from.id === ADMIN_ID) await sho
 
 bot.action('open_admin_panel', async ctx => { if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('Нет доступа'); try { await openAdminPanel(ctx); } catch (e) { console.error('open panel error', e); } });
 
-// approve / reject / delete (admin)
+// ---------- Approve / Reject / Delete (admin) ----------
 bot.action(/approve_([0-9a-fA-F\-]{36})/, async ctx => {
   try {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery('Нет доступа');
@@ -515,8 +521,8 @@ bot.action(/approve_([0-9a-fA-F\-]{36})/, async ctx => {
         await updateRequest(reqId, {
           original_slot_id: slot.id,
           original_slot_time: slot.time,
-          original_slot_start: slot.start ? slot.start.toISOString() : null,
-          original_slot_end: slot.end ? slot.end.toISOString() : null
+          original_slot_start: slot.start ? slot.start : null,
+          original_slot_end: slot.end ? slot.end : null
         });
       }
     }
@@ -706,9 +712,7 @@ bot.action(/clientMoveYes_([0-9a-fA-F\-]{36})/, async ctx => {
         `✔ Клиент подтвердил перенос. Новое время: ${escapeHtml(newSlot.time)}`,
         { reply_markup: { inline_keyboard: [[{ text: '🛠 Открыть панель', callback_data: 'open_admin_panel' }]] } }
       );
-    } catch (e) {
-      console.error('notify admin move confirmed error:', e);
-    }
+    } catch (e) { console.error('notify admin move confirmed', e); }
 
     await ctx.answerCbQuery();
   } catch (err) {
@@ -749,8 +753,45 @@ bot.catch((err, ctx) => {
 });
 
 // graceful stop
-process.once('SIGINT', () => { bot.stop('SIGINT'); pool.end(); });
-process.once('SIGTERM', () => { bot.stop('SIGTERM'); pool.end(); });
+async function shutdown() {
+  try {
+    if (WEBHOOK_URL) {
+      try {
+        await bot.telegram.deleteWebhook();
+        console.log('Webhook deleted');
+      } catch (e) {
+        console.error('Failed to delete webhook on shutdown:', e);
+      }
+    }
+  } catch (e) { console.error('shutdown error:', e); }
+  try { await pool.end(); } catch (e) {}
+  process.exit(0);
+}
+process.once('SIGINT', shutdown);
+process.once('SIGTERM', shutdown);
 
-// start
-bot.launch().then(() => console.log('Bot started (Postgres)!')).catch(err => console.error('Bot launch error:', err));
+(async () => {
+  if (WEBHOOK_URL) {
+    const app = express();
+
+    const hookPath = `/bot${BOT_TOKEN}`;
+
+    app.use(bot.webhookCallback(hookPath));
+
+    try {
+      const setRes = await bot.telegram.setWebhook(`${WEBHOOK_URL}${hookPath}`);
+      console.log('Webhook set result:', setRes);
+    } catch (e) {
+      console.error('Failed to set webhook:', e);
+    }
+
+    app.get('/', (req, res) => res.send('OK'));
+    app.listen(PORT, () => console.log(`Express server listening on ${PORT}, webhook path ${hookPath}`));
+  } else {
+    console.warn('WEBHOOK_URL / RENDER_EXTERNAL_URL not set — falling back to polling (for local dev). For Render Web Service set WEBHOOK_URL to public URL and redeploy.');
+    await bot.launch();
+  }
+})().catch(err => {
+  console.error('Startup error:', err);
+  process.exit(1);
+});
