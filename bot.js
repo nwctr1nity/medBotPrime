@@ -108,14 +108,10 @@ bot.action('choose_slots', async ctx => {
     if (!allSlots || allSlots.length === 0) return ctx.answerCbQuery('Слотов нет');
     let slotsToShow = allSlots;
     if (earliest) {
-      const earliestTime = (earliest.start instanceof Date) ? earliest.start.getTime() : new Date(earliest.start).getTime();
-      slotsToShow = allSlots.filter(s => {
-        const sStart = (s.start instanceof Date) ? s.start.getTime() : new Date(s.start).getTime();
-        return sStart > earliestTime;
-      });
+      const earliestTime = new Date(earliest.start).getTime();
+      slotsToShow = allSlots.filter(s => new Date(s.start).getTime() > earliestTime);
     }
     if (!slotsToShow || slotsToShow.length === 0) {
-      // fallback: if none later, show all
       slotsToShow = allSlots;
     }
     const buttons = slotsToShow.slice(0, 30).map(s => [Markup.button.callback(s.time, `cond_${s.id}`)]);
@@ -124,12 +120,58 @@ bot.action('choose_slots', async ctx => {
   } catch (e) { console.error('choose_slots error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
+// conditional: need procedure selection too
 bot.action(/^cond_([0-9a-fA-F\-]{36})$/, async ctx => {
   try {
     if (await db.isUserBlacklisted(pool, ctx.from.username)) return ctx.answerCbQuery('Недоступно', { show_alert: true });
     const slotId = ctx.match[1];
     const slot = await db.getSlotById(pool, slotId);
     if (!slot) return ctx.answerCbQuery('Слот недоступен', { show_alert: true });
+
+    const dup = await db.checkDuplicateRequest(pool, ctx.from.id, slotId);
+    if (dup) return ctx.answerCbQuery('У вас уже есть заявка на этот слот', { show_alert: true });
+
+    // ask for procedure selection like normal flow
+    const procs = await db.getProcedures(pool);
+    if (!procs || procs.length === 0) {
+      // create conditional without procedure
+      const req = {
+        id: randomUUID(),
+        userId: ctx.from.id,
+        username: ctx.from.username || null,
+        name: ctx.from.first_name || '',
+        slotId: slot.id,
+        time: slot.time,
+        procedure: null,
+        status: 'conditional',
+        createdAt: new Date().toISOString()
+      };
+      await db.addRequestDb(pool, req);
+      await ctx.reply(`Ваша заявка на ${slot.time} создана условно. Она будет автоматически оформлена, если за ${CONDITIONAL_THRESHOLD_HOURS} часов до записи не останется более ранних незанятых слотов подтверждёнными заявками.`);
+      try { await db.sendToAdmins(pool, bot, `🕒 Условная заявка: ${ctx.from.username ? '@'+ctx.from.username : ctx.from.first_name} → ${slot.time}`); } catch (e) { console.error('notify admin conditional failed', e); }
+      return ctx.answerCbQuery();
+    }
+
+    // present procedures as buttons, encode both slotId and procKey in callback
+    const procButtons = procs.map(p => [Markup.button.callback(p.name, `condproc_${slot.id}_${p.key}`)]);
+    await ctx.reply('Выберите процедуру для условной заявки:', Markup.inlineKeyboard(procButtons));
+    await ctx.answerCbQuery();
+  } catch (e) {
+    console.error('cond handler error', e);
+    try { await ctx.answerCbQuery('Ошибка'); } catch (_) {}
+  }
+});
+
+bot.action(/^condproc_([0-9a-fA-F\-]{36})_(.+)$/u, async ctx => {
+  try {
+    const slotId = ctx.match[1];
+    const procKey = ctx.match[2];
+
+    const slot = await db.getSlotById(pool, slotId);
+    if (!slot) return ctx.answerCbQuery('Слот недоступен', { show_alert: true });
+
+    const proc = await db.getProcedureByKey(pool, procKey);
+    if (!proc) return ctx.answerCbQuery('Процедура недоступна', { show_alert: true });
 
     const dup = await db.checkDuplicateRequest(pool, ctx.from.id, slotId);
     if (dup) return ctx.answerCbQuery('У вас уже есть заявка на этот слот', { show_alert: true });
@@ -141,18 +183,18 @@ bot.action(/^cond_([0-9a-fA-F\-]{36})$/, async ctx => {
       name: ctx.from.first_name || '',
       slotId: slot.id,
       time: slot.time,
-      procedure: null,
+      procedure: proc.name,
       status: 'conditional',
       createdAt: new Date().toISOString()
     };
     await db.addRequestDb(pool, req);
 
-    await ctx.reply(`Ваша заявка на ${slot.time} создана условно. Она будет автоматически оформлена, если за ${CONDITIONAL_THRESHOLD_HOURS} часов до записи не останется более ранних незанятых слотов подтверждёнными заявками.`);
-    try { await db.sendToAdmins(pool, bot, `🕒 Условная заявка: ${ctx.from.username ? '@'+ctx.from.username : ctx.from.first_name} → ${slot.time}`); } catch (e) { console.error('notify admin conditional failed', e); }
+    await ctx.reply(`Ваша условная заявка на ${slot.time} (процедура: ${proc.name}) создана. Она будет автоматически оформлена, если за ${CONDITIONAL_THRESHOLD_HOURS} часов до записи не останется более ранних незанятых слотов подтверждёнными заявками.`);
+    try { await db.sendToAdmins(pool, bot, `🕒 Условная заявка: ${ctx.from.username ? '@'+ctx.from.username : ctx.from.first_name} → ${slot.time} (${proc.name})`); } catch (e) { console.error('notify admin conditional failed', e); }
 
     await ctx.answerCbQuery();
   } catch (e) {
-    console.error('cond handler error', e);
+    console.error('condproc handler error', e);
     try { await ctx.answerCbQuery('Ошибка'); } catch (_) {}
   }
 });
@@ -193,7 +235,7 @@ bot.action(/^proc_([0-9a-fA-F\-]{36})_(.+)$/u, async ctx => {
     const dup = await db.checkDuplicateRequest(pool, ctx.from.id, slotId);
     if (dup) return ctx.answerCbQuery('Вы уже отправляли заявку на этот слот.', { show_alert: true });
 
-    // Important: DO NOT delete the slot here. Pending should not claim the slot yet.
+    // Do NOT delete slot here (pending shouldn't claim slot)
     const req = {
       id: randomUUID(),
       userId: ctx.from.id,
@@ -259,6 +301,7 @@ bot.action(/delproc_(.+)/, async ctx => {
   } catch (e) { console.error('delproc error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
+// text handlers (addproc, addslot, blacklist, patterns, feedback) remain unchanged
 bot.on('text', async ctx => {
   try {
     const st = adminStates[ctx.from.id];
@@ -445,8 +488,8 @@ function adminPanelKeyboard() {
     [Markup.button.callback('🟢 Подтверждённые', 'req_approved')],
     [Markup.button.callback('🔴 Отклонённые', 'req_rejected')],
     [Markup.button.callback('🔵 Ожидающие переноса', 'req_move_pending')],
-    [Markup.button.callback('🟣 Условные', 'req_conditional')],
     [Markup.button.callback('✅ Выполненные', 'req_completed'), Markup.button.callback('🚫 Неявки', 'req_no_show')],
+    [Markup.button.callback('🟣 Условные', 'req_conditional')],
     [Markup.button.callback('🛠 Управлять процедурами', 'manage_procedures')],
     [Markup.button.callback('⚠️ Черный список', 'manage_blacklist')],
     [Markup.button.callback('📅 Шаблоны', 'manage_patterns')],
@@ -464,7 +507,6 @@ bot.action(/activate_cond_(.+)/, async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
   try {
     const id = ctx.match[1];
-    // Manual activation by admin: set to pending immediately (admin chooses to bypass timing checks)
     await db.updateRequest(pool, id, { status: 'pending' });
     try { await ctx.editMessageText('Условная заявка вручную переведена в pending (ожидающие).'); } catch (_) {}
     const req = await db.getRequestById(pool, id);
@@ -505,7 +547,12 @@ bot.action(/reject_([0-9a-fA-F\-]{36})/, async ctx => {
     if (!req) return ctx.answerCbQuery('Заявка не найдена');
 
     if (req.original_slot_id && req.original_slot_time && (req.original_slot_start || req.original_slot_end)) {
-      try { await db.addSlotToDb(pool, req.original_slot_id, req.original_slot_time, req.original_slot_start, req.original_slot_end); } catch (e) { console.error('Failed to restore slot on reject:', e); }
+      try {
+        // use addSlotToDb which contains ON CONFLICT DO NOTHING
+        await db.addSlotToDb(pool, req.original_slot_id, req.original_slot_time, req.original_slot_start, req.original_slot_end);
+      } catch (e) {
+        console.error('Failed to restore slot on reject (ignored):', e);
+      }
     }
 
     await db.updateRequest(pool, reqId, { status: 'rejected' });
@@ -523,6 +570,74 @@ bot.action(/delete_([0-9a-fA-F\-]{36})/, async ctx => {
     try { await ctx.editMessageText('🗑 Заявка удалена.'); } catch (_) {}
     await ctx.answerCbQuery();
   } catch (e) { console.error('delete error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
+});
+
+// NEW: complete and no_show handlers
+bot.action(/complete_([0-9a-fA-F\-]{36})/, async ctx => {
+  try {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+    const reqId = ctx.match[1];
+    const req = await db.getRequestById(pool, reqId);
+    if (!req) return ctx.answerCbQuery('Заявка не найдена');
+
+    await db.updateRequest(pool, reqId, { status: 'completed' });
+    try { await ctx.editMessageText('✅ Отмечено как выполнено'); } catch (_) {}
+    try { await bot.telegram.sendMessage(req.user_id, `Ваша запись на ${req.time} отмечена как выполненная.`); } catch (e) { console.error('notify complete error', e); }
+    await ctx.answerCbQuery();
+  } catch (e) { console.error('complete error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
+});
+
+bot.action(/no_show_([0-9a-fA-F\-]{36})/, async ctx => {
+  try {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+    const reqId = ctx.match[1];
+    const req = await db.getRequestById(pool, reqId);
+    if (!req) return ctx.answerCbQuery('Заявка не найдена');
+
+    await db.updateRequest(pool, reqId, { status: 'no_show' });
+    try { await ctx.editMessageText('🚫 Отмечено как неявка'); } catch (_) {}
+    try { await bot.telegram.sendMessage(req.user_id, `Ваша запись на ${req.time} отмечена как неявка.`); } catch (e) { console.error('notify no_show error', e); }
+    await ctx.answerCbQuery();
+  } catch (e) { console.error('no_show error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
+});
+
+// MOVE flow: admin chooses to move a request -> shows available slots -> admin picks one -> adminMoveRequest does transaction
+bot.action(/^move_([0-9a-fA-F\-]{36})$/, async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  try {
+    const reqId = ctx.match[1];
+    const req = await db.getRequestById(pool, reqId);
+    if (!req) return ctx.answerCbQuery('Заявка не найдена');
+    const slots = await db.getAllSlots(pool);
+    if (!slots || slots.length === 0) return ctx.answerCbQuery('Нет доступных слотов');
+    const buttons = slots.slice(0, 30).map(s => [Markup.button.callback(s.time, `move_to_${reqId}_${s.id}`)]);
+    await ctx.reply('Выберите новый слот для переноса (администратор):', Markup.inlineKeyboard(buttons));
+    await ctx.answerCbQuery();
+  } catch (e) {
+    console.error('move action error', e);
+    try { await ctx.answerCbQuery('Ошибка'); } catch (_) {}
+  }
+});
+
+bot.action(/^move_to_([0-9a-fA-F\-]{36})_([0-9a-fA-F\-]{36})$/, async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  try {
+    const reqId = ctx.match[1];
+    const slotId = ctx.match[2];
+    const res = await db.adminMoveRequest(pool, reqId, slotId);
+    if (!res.ok) {
+      await ctx.reply(`Не удалось перенести заявку: ${res.message || 'ошибка'}`);
+      await ctx.answerCbQuery();
+      return;
+    }
+    const req = await db.getRequestById(pool, reqId);
+    try { await ctx.editMessageText(`🔁 Заявка перенесена на ${res.new_time}`); } catch (_) {}
+    try { await bot.telegram.sendMessage(req.user_id, `Ваша заявка была перенесена на ${res.new_time} (администратор).`); } catch (e) { console.error('notify move error', e); }
+    await ctx.answerCbQuery();
+  } catch (e) {
+    console.error('move_to handler error', e);
+    try { await ctx.answerCbQuery('Ошибка'); } catch (_) {}
+  }
 });
 
 bot.action('manage_patterns', async ctx => {
@@ -631,6 +746,9 @@ process.once('SIGTERM', shutdown);
 
 notifications.start(pool, bot, { conditionalThresholdHours: CONDITIONAL_THRESHOLD_HOURS });
 
+// webhook/polling logic: keep original behavior (if WEBHOOK_URL present it will set webhook; if you run locally without webhook, it will fall back to polling)
+// IMPORTANT: If you deploy to render with webhook, ensure WEBHOOK_URL env var and that express app receives requests (original code).
+// If you run locally (no WEBHOOK_URL), polling will be used (bot.launch()).
 (async () => {
   if (WEBHOOK_URL) {
     const app = express();

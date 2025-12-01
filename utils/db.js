@@ -1,4 +1,4 @@
-// db.js
+// utils/db.js
 const { randomUUID } = require('crypto');
 
 async function initDb(pool) {
@@ -91,7 +91,8 @@ async function getSlotById(pool, id) {
   return res.rows[0] || null;
 }
 async function addSlotToDb(pool, id, time, startIso, endIso) {
-  await pool.query('INSERT INTO slots(id, time, start, "end") VALUES ($1,$2,$3,$4)', [id, time, startIso, endIso]);
+  // prevent duplicate key errors on re-adding original slot
+  await pool.query('INSERT INTO slots(id, time, start, "end") VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING', [id, time, startIso, endIso]);
 }
 async function deleteSlotById(pool, id) {
   await pool.query('DELETE FROM slots WHERE id=$1', [id]);
@@ -235,7 +236,65 @@ async function sendToAdmins(pool, bot, text, opts = {}) {
   }
 }
 
+/**
+ * Admin move request:
+ * - transactionally moves request to new slot (admin chose)
+ * - re-adds original slot if needed
+ * - deletes new slot and sets request.slot_id -> new slot, status -> approved
+ */
+async function adminMoveRequest(pool, reqId, newSlotId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const reqRes = await client.query('SELECT * FROM requests WHERE id=$1 FOR UPDATE', [reqId]);
+    const req = reqRes.rows[0];
+    if (!req) {
+      await client.query('ROLLBACK');
+      return { ok: false, message: 'request_not_found' };
+    }
+
+    const slotRes = await client.query('SELECT * FROM slots WHERE id=$1 FOR UPDATE', [newSlotId]);
+    const newSlot = slotRes.rows[0];
+    if (!newSlot) {
+      await client.query('ROLLBACK');
+      return { ok: false, message: 'slot_not_found' };
+    }
+
+    // if request was previously approved and original slot existed -> re-add it
+    if (req.prev_status === 'approved' && req.original_slot_id && (req.original_slot_start || req.original_slot_end)) {
+      try {
+        await client.query(
+          `INSERT INTO slots(id, time, start, "end") VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING`,
+          [req.original_slot_id, req.original_slot_time, req.original_slot_start, req.original_slot_end]
+        );
+      } catch (e) {
+        console.error('Failed to re-add original slot (best-effort):', e);
+      }
+    }
+
+    // delete the chosen new slot (claim it)
+    await client.query('DELETE FROM slots WHERE id=$1', [newSlot.id]);
+
+    // update request to point to new slot and set approved
+    await client.query(
+      `UPDATE requests SET slot_id = $2, time = $3, status = $4, prev_status = NULL, pending_move_slot_id = NULL, pending_move_time = NULL WHERE id = $1`,
+      [reqId, newSlot.id, newSlot.time, 'approved']
+    );
+
+    await client.query('COMMIT');
+    return { ok: true, new_time: newSlot.time };
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error('adminMoveRequest transaction error:', err);
+    return { ok: false, message: 'tx_error' };
+  } finally {
+    client.release();
+  }
+}
+
 async function applyClientMove(pool, reqId) {
+  // keep existing for backward compatibility (not used in admin flow)
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -308,14 +367,6 @@ async function getConditionalRequests(pool) {
   return res.rows;
 }
 
-/**
- * promoteConditionalRequest:
- * - locks request & slot
- * - if slot missing => reject
- * - if now < slotStart - threshold => too_early
- * - checks all slots earlier than this slot.start: if any of them is NOT covered by an 'approved' request => don't promote
- * - otherwise set request.status = 'pending' (do NOT delete slot here; deletion happens on approve)
- */
 async function promoteConditionalRequest(pool, reqId, thresholdHours) {
   const client = await pool.connect();
   try {
@@ -335,7 +386,6 @@ async function promoteConditionalRequest(pool, reqId, thresholdHours) {
 
     const slotRes = await client.query('SELECT * FROM slots WHERE id=$1 FOR UPDATE', [req.slot_id]);
     if (slotRes.rowCount === 0) {
-      // slot already taken/removed
       await client.query('UPDATE requests SET status = $1 WHERE id = $2', ['rejected', reqId]);
       await client.query('COMMIT');
       return { ok: false, reason: 'slot_taken' };
@@ -345,17 +395,15 @@ async function promoteConditionalRequest(pool, reqId, thresholdHours) {
     const now = new Date();
     const msThreshold = Number(thresholdHours) * 3600 * 1000;
     if (now.getTime() < slotStart.getTime() - msThreshold) {
-      // too early to consider promotion
       await client.query('ROLLBACK');
       return { ok: false, reason: 'too_early' };
     }
 
-    // Find if there are any slots earlier than target slot.start
+    // Find earlier slots and ensure ALL of them are covered by approved requests
     const earlySlotsRes = await client.query('SELECT id FROM slots WHERE start < $1', [slot.start]);
     const earlySlots = earlySlotsRes.rows.map(r => r.id);
 
     if (earlySlots.length > 0) {
-      // check if ANY of those early slots is NOT covered by an approved request
       const notCoveredRes = await client.query(
         `SELECT s.id
          FROM slots s
@@ -365,13 +413,11 @@ async function promoteConditionalRequest(pool, reqId, thresholdHours) {
         [earlySlots]
       );
       if (notCoveredRes.rowCount > 0) {
-        // there exists at least one early slot that is not covered by approved request => cannot promote
         await client.query('ROLLBACK');
         return { ok: false, reason: 'early_slots_free' };
       }
     }
 
-    // All earlier slots are covered by approved requests (or no earlier slots exist) AND we are within threshold => promote to pending
     await client.query('UPDATE requests SET status = $2 WHERE id = $1', [reqId, 'pending']);
     await client.query('COMMIT');
     return { ok: true, new_time: slot.time };
@@ -420,6 +466,7 @@ module.exports = {
   getBlacklist,
 
   sendToAdmins,
+  adminMoveRequest,
   applyClientMove,
   getApprovedRequestsNeedingNotifications,
   getConditionalRequests,

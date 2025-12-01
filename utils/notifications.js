@@ -1,4 +1,4 @@
-// notifications.js
+// utils/notifications.js
 const INTERVAL_MS = 60 * 1000;
 let timer = null;
 let running = false;
@@ -54,11 +54,9 @@ function start(pool, bot, opts = {}) {
         }
       }
 
-      // process conditional requests
       const conditionals = await db.getConditionalRequests(pool);
       for (const c of conditionals) {
         try {
-          // try to promote according to rules
           const res = await db.promoteConditionalRequest(pool, c.id, thresholdHours);
           if (res.ok) {
             try {
@@ -68,12 +66,10 @@ function start(pool, bot, opts = {}) {
               await db.sendToAdmins(pool, bot, `✔ Условная заявка оформлена: ${c.username ? '@'+c.username : c.name} → ${res.new_time}`);
             } catch (e) {}
           } else {
-            // if slot was removed/claimed — reject the conditional
             if (res.reason === 'slot_taken' || res.reason === 'no_slot') {
               try { await db.updateRequest(pool, c.id, { status: 'rejected' }); } catch (_) {}
               try { await bot.telegram.sendMessage(c.user_id, `К сожалению, слот стал недоступен и ваша условная заявка отклонена.`); } catch (e) {}
             }
-            // other reasons (too_early, early_slots_free) -> do nothing, we'll check later
           }
         } catch (e) {
           console.error('processing conditional request error', e);
