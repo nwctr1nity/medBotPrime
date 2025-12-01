@@ -100,11 +100,6 @@ bot.hears('📝 Оставить заявку', async ctx => {
   } catch (e) { console.error('start request error', e); }
 });
 
-bot.on('callback_query', async ctx => {
-  console.log('CALLBACK:', ctx.update.callback_query.data);
-  await ctx.answerCbQuery();
-});
-
 bot.action('choose_slots', async ctx => {
   try {
     // show only slots later than the earliest (to follow UX requirement)
