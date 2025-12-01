@@ -546,13 +546,13 @@ bot.action(/reject_([0-9a-fA-F\-]{36})/, async ctx => {
     const req = await db.getRequestById(pool, reqId);
     if (!req) return ctx.answerCbQuery('Заявка не найдена');
 
-    if (req.original_slot_id && req.original_slot_time && (req.original_slot_start || req.original_slot_end)) {
-      try {
-        // use addSlotToDb which contains ON CONFLICT DO NOTHING
-        await db.addSlotToDb(pool, req.original_slot_id, req.original_slot_time, req.original_slot_start, req.original_slot_end);
-      } catch (e) {
-        console.error('Failed to restore slot on reject (ignored):', e);
-      }
+    if (req.original_slot_id) {
+        await client.query(
+            `INSERT INTO slots(id, time, start, "end")
+             VALUES ($1,$2,$3,$4)
+             ON CONFLICT (id) DO NOTHING`,
+            [req.original_slot_id, req.original_slot_time, req.original_slot_start, req.original_slot_end]
+        );
     }
 
     await db.updateRequest(pool, reqId, { status: 'rejected' });
@@ -603,41 +603,43 @@ bot.action(/no_show_([0-9a-fA-F\-]{36})/, async ctx => {
 
 // MOVE flow: admin chooses to move a request -> shows available slots -> admin picks one -> adminMoveRequest does transaction
 bot.action(/^move_([0-9a-fA-F\-]{36})$/, async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-  try {
     const reqId = ctx.match[1];
+
     const req = await db.getRequestById(pool, reqId);
-    if (!req) return ctx.answerCbQuery('Заявка не найдена');
+    if (!req) return ctx.answerCbQuery("Заявка не найдена");
+
     const slots = await db.getAllSlots(pool);
-    if (!slots || slots.length === 0) return ctx.answerCbQuery('Нет доступных слотов');
-    const buttons = slots.slice(0, 30).map(s => [Markup.button.callback(s.time, `move_to_${reqId}_${s.id}`)]);
-    await ctx.reply('Выберите новый слот для переноса (администратор):', Markup.inlineKeyboard(buttons));
+
+    const buttons = slots.map(s => [
+        Markup.button.callback(s.time, `move_choose_${reqId}_${s.id}`)
+    ]);
+
+    await ctx.reply(
+        "Выберите новый слот для переноса:",
+        Markup.inlineKeyboard(buttons)
+    );
+
     await ctx.answerCbQuery();
-  } catch (e) {
-    console.error('move action error', e);
-    try { await ctx.answerCbQuery('Ошибка'); } catch (_) {}
-  }
 });
 
-bot.action(/^move_to_([0-9a-fA-F\-]{36})_([0-9a-fA-F\-]{36})$/, async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-  try {
+bot.action(/^move_choose_([0-9a-fA-F\-]{36})_([0-9a-fA-F\-]{36})$/, async ctx => {
     const reqId = ctx.match[1];
     const slotId = ctx.match[2];
-    const res = await db.adminMoveRequest(pool, reqId, slotId);
-    if (!res.ok) {
-      await ctx.reply(`Не удалось перенести заявку: ${res.message || 'ошибка'}`);
-      await ctx.answerCbQuery();
-      return;
-    }
-    const req = await db.getRequestById(pool, reqId);
-    try { await ctx.editMessageText(`🔁 Заявка перенесена на ${res.new_time}`); } catch (_) {}
-    try { await bot.telegram.sendMessage(req.user_id, `Ваша заявка была перенесена на ${res.new_time} (администратор).`); } catch (e) { console.error('notify move error', e); }
+
+    const slot = await db.getSlotById(pool, slotId);
+    if (!slot) return ctx.answerCbQuery("Слот недоступен");
+
+    await db.updateRequest(pool, reqId, {
+        pending_move_slot_id: slot.id,
+        pending_move_time: slot.time,
+        status: "move_pending",
+        prev_status: (await db.getRequestById(pool, reqId)).status
+    });
+
+    await ctx.editMessageText(
+        `Запрос на перенос создан:\nНовый слот: ${slot.time}`
+    );
     await ctx.answerCbQuery();
-  } catch (e) {
-    console.error('move_to handler error', e);
-    try { await ctx.answerCbQuery('Ошибка'); } catch (_) {}
-  }
 });
 
 bot.action('manage_patterns', async ctx => {
