@@ -1,3 +1,4 @@
+// db.js
 const { randomUUID } = require('crypto');
 
 async function initDb(pool) {
@@ -111,7 +112,6 @@ async function getProcedureByKey(pool, key) {
   return res.rows[0] || null;
 }
 
-// requests
 async function addRequestDb(pool, req) {
   await pool.query(
     `INSERT INTO requests(id, user_id, username, name, slot_id, time, procedure, status, created_at, original_slot_id, original_slot_time, original_slot_start, original_slot_end, notification_20_sent, notification_1h_sent)
@@ -152,7 +152,6 @@ async function deleteRequestById(pool, id) {
   await pool.query('DELETE FROM requests WHERE id=$1', [id]);
 }
 
-// history
 async function addHistoryItem(pool, userId, date, procedure, status) {
   await pool.query('INSERT INTO history(user_id, date, procedure, status) VALUES($1,$2,$3,$4)', [userId, date, procedure, status]);
 }
@@ -161,7 +160,6 @@ async function getHistoryForUser(pool, userId) {
   return res.rows;
 }
 
-// patterns
 async function addPatternDb(pool, pattern) {
   await pool.query('INSERT INTO patterns(id, name, intervals) VALUES($1,$2,$3)', [pattern.id, pattern.name, pattern.intervals]);
 }
@@ -177,14 +175,6 @@ async function getPatternById(pool, id) {
   return res.rows[0] || null;
 }
 
-/**
- * applyPatternToDate
- * patternId - uuid
- * dateStr - 'YYYY-MM-DD'
- * Creates slots for each interval in pattern.intervals (format "HH:MM-HH:MM,HH:MM-HH:MM")
- * Prevents overlaps: checks slots table for overlaps and skips conflicting intervals.
- * Returns { created: number }
- */
 async function applyPatternToDate(pool, patternId, dateStr) {
   const pat = await getPatternById(pool, patternId);
   if (!pat || !pat.intervals) return { created: 0 };
@@ -202,7 +192,6 @@ async function applyPatternToDate(pool, patternId, dateStr) {
     const end = new Date(Date.UTC(year, month - 1, day, eh, em, 0, 0));
     if (end.getTime() <= start.getTime()) continue;
 
-    // check overlap: slots where NOT (start >= end_new OR end <= start_new)
     const overlapRes = await pool.query('SELECT 1 FROM slots WHERE NOT (start >= $1 OR "end" <= $2) LIMIT 1', [end.toISOString(), start.toISOString()]);
     if (overlapRes.rowCount === 0) {
       const timeStr = `${String(start.getUTCDate()).padStart(2,'0')}.${String(start.getUTCMonth()+1).padStart(2,'0')}.${start.getUTCFullYear()} ${String(start.getUTCHours()).padStart(2,'0')}:${String(start.getUTCMinutes()).padStart(2,'0')}-${String(end.getUTCHours()).padStart(2,'0')}:${String(end.getUTCMinutes()).padStart(2,'0')}`;
@@ -215,7 +204,6 @@ async function applyPatternToDate(pool, patternId, dateStr) {
   return { created };
 }
 
-// blacklist
 async function isUserBlacklisted(pool, username) {
   if (!username) return false;
   const uname = username.replace(/^@/, '').toLowerCase();
@@ -235,7 +223,6 @@ async function getBlacklist(pool) {
   return res.rows.map(r => r.username);
 }
 
-// helper to send to admins
 async function sendToAdmins(pool, bot, text, opts = {}) {
   const ADMIN_IDS_RAW = process.env.ADMIN_IDS || String(process.env.ADMIN_ID || '');
   const ADMIN_IDS = ADMIN_IDS_RAW.split(',').map(s => s.trim()).filter(Boolean).map(s => Number(s)).filter(n => !Number.isNaN(n));
@@ -248,7 +235,6 @@ async function sendToAdmins(pool, bot, text, opts = {}) {
   }
 }
 
-// apply client-confirmed move (transactional)
 async function applyClientMove(pool, reqId) {
   const client = await pool.connect();
   try {
@@ -307,7 +293,6 @@ async function applyClientMove(pool, reqId) {
   }
 }
 
-// helper used by notifications: fetch requests needing notifications
 async function getApprovedRequestsNeedingNotifications(pool) {
   const rows = await pool.query(`
     SELECT r.*, s.start as slot_start, s.time as slot_time
@@ -316,6 +301,87 @@ async function getApprovedRequestsNeedingNotifications(pool) {
     WHERE r.status = 'approved' AND (COALESCE(r.notification_20_sent,false) = false OR COALESCE(r.notification_1h_sent,false) = false)
   `);
   return rows.rows;
+}
+
+async function getConditionalRequests(pool) {
+  const res = await pool.query("SELECT * FROM requests WHERE status = 'conditional' ORDER BY created_at");
+  return res.rows;
+}
+
+/**
+ * promoteConditionalRequest:
+ * - locks request & slot
+ * - if slot missing => reject
+ * - if now < slotStart - threshold => too_early
+ * - checks all slots earlier than this slot.start: if any of them is NOT covered by an 'approved' request => don't promote
+ * - otherwise set request.status = 'pending' (do NOT delete slot here; deletion happens on approve)
+ */
+async function promoteConditionalRequest(pool, reqId, thresholdHours) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const reqRes = await client.query('SELECT * FROM requests WHERE id=$1 FOR UPDATE', [reqId]);
+    const req = reqRes.rows[0];
+    if (!req) {
+      await client.query('ROLLBACK');
+      return { ok: false, reason: 'not_found' };
+    }
+    if (!req.slot_id) {
+      await client.query('UPDATE requests SET status = $1 WHERE id = $2', ['rejected', reqId]);
+      await client.query('COMMIT');
+      return { ok: false, reason: 'no_slot' };
+    }
+
+    const slotRes = await client.query('SELECT * FROM slots WHERE id=$1 FOR UPDATE', [req.slot_id]);
+    if (slotRes.rowCount === 0) {
+      // slot already taken/removed
+      await client.query('UPDATE requests SET status = $1 WHERE id = $2', ['rejected', reqId]);
+      await client.query('COMMIT');
+      return { ok: false, reason: 'slot_taken' };
+    }
+    const slot = slotRes.rows[0];
+    const slotStart = new Date(slot.start);
+    const now = new Date();
+    const msThreshold = Number(thresholdHours) * 3600 * 1000;
+    if (now.getTime() < slotStart.getTime() - msThreshold) {
+      // too early to consider promotion
+      await client.query('ROLLBACK');
+      return { ok: false, reason: 'too_early' };
+    }
+
+    // Find if there are any slots earlier than target slot.start
+    const earlySlotsRes = await client.query('SELECT id FROM slots WHERE start < $1', [slot.start]);
+    const earlySlots = earlySlotsRes.rows.map(r => r.id);
+
+    if (earlySlots.length > 0) {
+      // check if ANY of those early slots is NOT covered by an approved request
+      const notCoveredRes = await client.query(
+        `SELECT s.id
+         FROM slots s
+         LEFT JOIN requests r ON r.slot_id = s.id AND r.status = 'approved'
+         WHERE s.id = ANY($1) AND r.id IS NULL
+         LIMIT 1`,
+        [earlySlots]
+      );
+      if (notCoveredRes.rowCount > 0) {
+        // there exists at least one early slot that is not covered by approved request => cannot promote
+        await client.query('ROLLBACK');
+        return { ok: false, reason: 'early_slots_free' };
+      }
+    }
+
+    // All earlier slots are covered by approved requests (or no earlier slots exist) AND we are within threshold => promote to pending
+    await client.query('UPDATE requests SET status = $2 WHERE id = $1', [reqId, 'pending']);
+    await client.query('COMMIT');
+    return { ok: true, new_time: slot.time };
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error('promoteConditionalRequest error', e);
+    return { ok: false, reason: 'error' };
+  } finally {
+    client.release();
+  }
 }
 
 module.exports = {
@@ -346,7 +412,7 @@ module.exports = {
   getPatternsDb,
   deletePatternDb,
   getPatternById,
-  applyPatternToDate, // NEW
+  applyPatternToDate,
 
   isUserBlacklisted,
   addToBlacklist,
@@ -355,5 +421,7 @@ module.exports = {
 
   sendToAdmins,
   applyClientMove,
-  getApprovedRequestsNeedingNotifications
+  getApprovedRequestsNeedingNotifications,
+  getConditionalRequests,
+  promoteConditionalRequest
 };
