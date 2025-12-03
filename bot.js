@@ -59,7 +59,7 @@ const pool = new Pool({
   }
 })();
 
-const adminStates = {};
+const adminStates = {}; // session maps per admin/user
 
 bot.start(async ctx => {
   try {
@@ -101,6 +101,17 @@ bot.hears('Обратная связь', async ctx => {
   } catch (e) { console.error('feedback start error', e); }
 });
 
+bot.hears('📚 История посещений', async ctx => {
+  try {
+    const rows = await db.getHistoryForUser(pool, ctx.from.id);
+    if (!rows || rows.length === 0) return ctx.reply('История пуста.');
+    let msg = 'Ваша история:\n\n';
+    rows.forEach(h => msg += `• ${utils.escapeHtml(h.date)} — ${utils.escapeHtml(h.procedure)} (${utils.escapeHtml(h.status)})\n`);
+    await ctx.reply(msg);
+  } catch (e) { console.error('history error', e); }
+});
+
+// choose later list of slots
 bot.action('choose_later', async ctx => {
   try {
     if (await db.isUserBlacklisted(pool, ctx.from.username)) return ctx.answerCbQuery('Нет доступа', { show_alert: true });
@@ -112,6 +123,7 @@ bot.action('choose_later', async ctx => {
   } catch (e) { console.error('choose_later error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
+// request flow: show procedures (use index map to avoid long callback_data)
 bot.action(/req_([0-9a-fA-F\-]{36})/, async ctx => {
   try {
     if (await db.isUserBlacklisted(pool, ctx.from.username)) return ctx.answerCbQuery('Свободных интервалов пока нет.', { show_alert: true });
@@ -129,25 +141,26 @@ bot.action(/req_([0-9a-fA-F\-]{36})/, async ctx => {
       return;
     }
 
-    adminStates[ctx.from.id].procMap = {};
+    // create map index -> key for this user session
+    const procMap = {};
     const procButtons = procs.map((p, i) => {
-      adminStates[ctx.from.id].procMap[i] = p.key;
-      // Use numeric index in callback_data to avoid long/heavy keys
+      procMap[i] = p.key;
       return [Markup.button.callback(p.name, `proc_${slotId}_${i}`)];
     });
+    adminStates[ctx.from.id].procMap = procMap;
 
     await ctx.reply('Выберите процедуру:', Markup.inlineKeyboard(procButtons));
     await ctx.answerCbQuery();
   } catch (e) { console.error('req action error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
+// proc selection: resolve index -> key
 bot.action(/^proc_([0-9a-fA-F\-]{36})_(.+)$/u, async ctx => {
   try {
     if (await db.isUserBlacklisted(pool, ctx.from.username)) return ctx.answerCbQuery('Свободных интервалов пока нет.', { show_alert: true });
     const slotId = ctx.match[1];
     let procKeyOrIdx = ctx.match[2];
 
-    // If procKeyOrIdx is a numeric index, resolve real key from session map
     const st = adminStates[ctx.from.id] || {};
     if (/^\d+$/.test(procKeyOrIdx) && st.procMap && st.procMap[procKeyOrIdx] !== undefined) {
       procKeyOrIdx = st.procMap[procKeyOrIdx];
@@ -218,7 +231,6 @@ bot.on('text', async ctx => {
     if (!st) return;
 
     if (st.mode === 'addproc') {
-      // Always generate a short, safe key to avoid callback_data length issues.
       const key = `proc_${randomUUID().slice(0,8)}`;
       try {
         await db.addProcedureDb(pool, key, text);
@@ -279,21 +291,31 @@ bot.on('text', async ctx => {
         return ctx.reply('Неверный формат даты. Ожидается DD.MM.YYYY');
       }
       const dateISO = `${d.year}-${String(d.month).padStart(2,'0')}-${String(d.day).padStart(2,'0')}`;
-      adminStates[ctx.from.id] = { mode: 'applypattern_choose', apply_date: dateISO };
-    
+      // save apply_date and switch to choose mode
+      adminStates[ctx.from.id] = adminStates[ctx.from.id] || {};
+      adminStates[ctx.from.id].mode = 'applypattern_choose';
+      adminStates[ctx.from.id].apply_date = dateISO;
+
       const pats = await db.getPatternsDb(pool);
       if (!pats || pats.length === 0) {
         delete adminStates[ctx.from.id];
         return ctx.reply('Шаблонов нет. Сначала добавьте шаблон.');
       }
-    
-      const buttons = pats.map(p => [ Markup.button.callback(p.name + (p.intervals ? ` (${p.intervals})` : ''), `applypattern_date_${p.id}`) ]);
+
+      // build index map for patterns to keep callback_data short
+      const map = {};
+      const buttons = pats.map((p, i) => {
+        map[i] = p.id;
+        return [Markup.button.callback(p.name + (p.intervals ? ` (${p.intervals})` : ''), `applypatternidx_${i}`)];
+      });
+      adminStates[ctx.from.id].managePatternMap = map;
+
       await ctx.reply('Выберите шаблон для применения на указанную дату:', Markup.inlineKeyboard(buttons));
       return;
     }
 
     if (st.mode === 'addpattern_wait_name') {
-      adminStates[ctx.from.id] = { mode: 'addpattern_wait_intervals', pattern_name: text };
+      adminStates[ctx.from.id] = Object.assign(adminStates[ctx.from.id] || {}, { mode: 'addpattern_wait_intervals', pattern_name: text });
       return ctx.reply('Отправьте интервалы шаблона в формате HH:MM-HH:MM,HH:MM-HH:MM (через запятую).');
     }
 
@@ -345,6 +367,7 @@ bot.action(/delslot_([0-9a-fA-F\-]{36})/, async ctx => {
   } catch (e) { console.error('delslot error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
+// requests listing shortcuts
 bot.action('req_pending', async ctx => { if (isAdmin(ctx)) await showRequestsByStatus(ctx, 'pending', '🟡 Ожидающие'); else ctx.answerCbQuery('Нет доступа'); });
 bot.action('req_approved', async ctx => { if (isAdmin(ctx)) await showRequestsByStatus(ctx, 'approved', '🟢 Подтверждённые'); else ctx.answerCbQuery('Нет доступа'); });
 bot.action('req_rejected', async ctx => { if (isAdmin(ctx)) await showRequestsByStatus(ctx, 'rejected', '🔴 Отклонённые'); else ctx.answerCbQuery('Нет доступа'); });
@@ -421,6 +444,7 @@ async function showReservedRequests(ctx) {
   }
 }
 
+// admin panel
 function adminPanelKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🟡 Ожидающие', 'req_pending')],
@@ -442,6 +466,7 @@ async function openAdminPanel(ctx) {
   try { await ctx.answerCbQuery(); } catch (_) {}
 }
 
+// unified approve/reject/delete handler
 bot.action(/^(approve|reject|delete)_([0-9a-fA-F\-]{36})$/, async ctx => {
   try {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
@@ -483,67 +508,265 @@ bot.action(/^(approve|reject|delete)_([0-9a-fA-F\-]{36})$/, async ctx => {
   }
 });
 
-bot.action(/^delprocidx_(\d+)$/, async ctx => {
-  try {
-    if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-    const idx = ctx.match[1];
-    const map = adminStates[ctx.from.id] && adminStates[ctx.from.id].manageProcMap;
-    if (!map) return ctx.answerCbQuery('Сессия устарела. Откройте "Управлять процедуры" снова.', { show_alert: true });
-    const key = map[idx];
-    if (!key) return ctx.answerCbQuery('Не удалось найти процедуру для удаления.', { show_alert: true });
-    await db.deleteProcedureDb(pool, key);
-    try { await ctx.reply('Процедура удалена.'); } catch (_) {}
-    await ctx.answerCbQuery();
-  } catch (e) {
-    console.error('delprocidx error', e);
-    try { await ctx.answerCbQuery('Ошибка при удалении процедуры'); } catch (_) {}
-  }
-});
+// ---- Patterns management (fixed: index-mapped buttons + apply-on-date flow) ----
 
-bot.action('manage_procedures', async ctx => {
+// manage_patterns: show delete buttons only, plus add/apply
+bot.action('manage_patterns', async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
   try {
-    const procs = await db.getProcedures(pool);
+    const patterns = await db.getPatternsDb(pool);
     const map = {};
-    const buttons = (procs || []).map((p, i) => {
+    const buttons = (patterns || []).map((p, i) => {
       const idx = String(i);
-      map[idx] = p.key;
-      return [Markup.button.callback(`Удалить ${utils.escapeHtml(p.name)}`, `delprocidx_${idx}`)];
+      map[idx] = p.id;
+      return [Markup.button.callback(`Удалить ${p.name}`, `delpatternidx_${idx}`)];
     });
-    buttons.push([Markup.button.callback('➕ Добавить процедуру', 'addproc')]);
+    buttons.push([Markup.button.callback('➕ Добавить шаблон', 'addpattern')]);
+    buttons.push([Markup.button.callback('🗓 Применить шаблон на дату', 'applypattern_start')]);
+
     adminStates[ctx.from.id] = adminStates[ctx.from.id] || {};
-    adminStates[ctx.from.id].manageProcMap = map;
-    await ctx.reply('Список процедур:', Markup.inlineKeyboard(buttons));
+    adminStates[ctx.from.id].managePatternMap = map;
+
+    await ctx.reply('Шаблоны расписания:', Markup.inlineKeyboard(buttons));
     await ctx.answerCbQuery();
   } catch (e) {
-    console.error('manage_procedures error', e);
+    console.error('manage_patterns error', e);
     try { await ctx.answerCbQuery('Ошибка'); } catch (_) {}
   }
 });
 
-bot.action('addproc', async ctx => {
+// delete pattern by index
+bot.action(/^delpatternidx_(\d+)$/, async ctx => {
+  try {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+    const idx = ctx.match[1];
+    const map = adminStates[ctx.from.id] && adminStates[ctx.from.id].managePatternMap;
+    if (!map) return ctx.answerCbQuery('Сессия устарела. Откройте "Шаблоны" снова.', { show_alert: true });
+    const patternId = map[idx];
+    if (!patternId) return ctx.answerCbQuery('Не удалось найти шаблон для удаления.', { show_alert: true });
+    await db.deletePatternDb(pool, patternId);
+    try { await ctx.reply('Шаблон удалён.'); } catch (_) {}
+    await ctx.answerCbQuery();
+  } catch (e) {
+    console.error('delpatternidx error', e);
+    try { await ctx.answerCbQuery('Ошибка при удалении шаблона'); } catch (_) {}
+  }
+});
+
+// add pattern: two-step
+bot.action('addpattern', async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-  adminStates[ctx.from.id] = { mode: 'addproc' };
-  await ctx.reply('Отправьте название процедуры (например: Ботулинотерапия). Я сгенерирую ключ автоматически.');
+  adminStates[ctx.from.id] = Object.assign(adminStates[ctx.from.id] || {}, { mode: 'addpattern_wait_name' });
+  await ctx.reply('Отправьте название шаблона:');
   await ctx.answerCbQuery();
 });
 
-// ... оставшиеся обработчики (patterns, blacklist, move, etc.) без изменений ...
+// start apply pattern on date flow
+bot.action('applypattern_start', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  adminStates[ctx.from.id] = Object.assign(adminStates[ctx.from.id] || {}, { mode: 'applypattern_wait_date' });
+  await ctx.reply('Отправьте дату в формате DD.MM.YYYY для применения шаблона:');
+  await ctx.answerCbQuery();
+});
 
+// applypattern index handler (after date + list shown)
+bot.action(/^applypatternidx_(\d+)$/, async ctx => {
+  try {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+    const idx = ctx.match[1];
+    const st = adminStates[ctx.from.id] || {};
+    const map = st.managePatternMap;
+    const dateISO = st.apply_date;
+    if (!map || !dateISO) return ctx.answerCbQuery('Сессия устарела. Повторите шаги: нажмите "Применить шаблон на дату".', { show_alert: true });
+    const patternId = map[idx];
+    if (!patternId) return ctx.answerCbQuery('Не удалось определить шаблон.', { show_alert: true });
+
+    const res = await db.applyPatternToDate(pool, patternId, dateISO);
+    delete adminStates[ctx.from.id].apply_date;
+    delete adminStates[ctx.from.id].managePatternMap;
+    delete adminStates[ctx.from.id].mode;
+
+    try { await ctx.reply(`Генерация слотов завершена. Создано: ${res.created}`); } catch (_) {}
+    await ctx.answerCbQuery();
+  } catch (e) {
+    console.error('applypatternidx error', e);
+    try { await ctx.answerCbQuery('Ошибка при применении шаблона'); } catch (_) {}
+  }
+});
+
+// fallback direct delpattern_ (keeps backward compat)
+bot.action(/delpattern_(.+)/, async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  try {
+    const id = ctx.match[1];
+    await db.deletePatternDb(pool, id);
+    await ctx.reply('Шаблон удалён.');
+    await ctx.answerCbQuery();
+  } catch (e) {
+    console.error('delpattern error', e);
+    try { await ctx.answerCbQuery('Ошибка при удалении шаблона'); } catch (_) {}
+  }
+});
+
+// ---- blacklist and other handlers unchanged ----
+
+bot.action('manage_blacklist', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  try {
+    const list = await db.getBlacklist(pool);
+    const buttons = list.map(u => [Markup.button.callback(`Удалить @${utils.escapeHtml(u)}`, `delblack_${u}`)]);
+    buttons.push([Markup.button.callback('➕ Добавить в ЧС', 'addblack')]);
+    await ctx.reply('Черный список:', Markup.inlineKeyboard(buttons));
+    await ctx.answerCbQuery();
+  } catch (e) {
+    console.error('manage_blacklist error', e);
+    try { await ctx.answerCbQuery('Ошибка'); } catch (_) {}
+  }
+});
+
+bot.action('addblack', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  adminStates[ctx.from.id] = { mode: 'addblack' };
+  await ctx.reply('Отправьте @username для добавления в черный список (пример: @ivan).');
+  await ctx.answerCbQuery();
+});
+
+bot.action(/delblack_(.+)/, async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  const uname = String(ctx.match[1] || '').replace(/^@/, '').toLowerCase();
+  try {
+    await db.removeFromBlacklist(pool, uname);
+    await ctx.reply(`Пользователь @${uname} удалён из ЧС.`);
+    await ctx.answerCbQuery();
+  } catch (e) {
+    console.error('delblack error', e);
+    try { await ctx.answerCbQuery('Ошибка при удалении из ЧС'); } catch (_) {}
+  }
+});
+
+// moves, confirms and notifications (unchanged logic)
+bot.action(/complete_([0-9a-fA-F\-]{36})/, async ctx => {
+  try {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+    const reqId = ctx.match[1];
+    const req = await db.getRequestById(pool, reqId);
+    if (!req) return ctx.answerCbQuery('Заявка не найдена');
+
+    await db.updateRequest(pool, reqId, { status: 'completed' });
+    await db.addHistoryItem(pool, req.user_id, req.time, req.procedure || 'Процедура', 'Выполнено');
+
+    try { await ctx.editMessageText('✅ Отмечено как выполнено'); } catch (_) {}
+    try { await bot.telegram.sendMessage(req.user_id, `✅ Ваша запись на ${req.time} помечена как выполненная.`); } catch (e) {}
+    try { await db.sendToAdmins(pool, bot, `✅ Клиент ${utils.makeUserLink(req.user_id, req.username, req.name)} — выполнено.\nВремя: ${utils.escapeHtml(req.time)}\nПроцедура: ${utils.escapeHtml(req.procedure || '-')}`, { parse_mode: 'HTML' }); } catch (e) {}
+
+    await ctx.answerCbQuery();
+  } catch (e) { console.error('complete error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
+});
+
+bot.action(/no_show_([0-9a-fA-F\-]{36})/, async ctx => {
+  try {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+    const reqId = ctx.match[1];
+    const req = await db.getRequestById(pool, reqId);
+    if (!req) return ctx.answerCbQuery('Заявка не найдена');
+
+    await db.updateRequest(pool, reqId, { status: 'no_show' });
+    await db.addHistoryItem(pool, req.user_id, req.time, req.procedure || 'Процедура', 'Неявка');
+
+    try { await ctx.editMessageText('🚫 Отмечено как неявка'); } catch (_) {}
+    try { await db.sendToAdmins(pool, bot, `🚫 Клиент ${utils.makeUserLink(req.user_id, req.username, req.name)} — не явился.\nВремя: ${utils.escapeHtml(req.time)}\nПроцедура: ${utils.escapeHtml(req.procedure || '-')}`, { parse_mode: 'HTML' }); } catch (e) {}
+
+    await ctx.answerCbQuery();
+  } catch (e) { console.error('no_show error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
+});
+
+bot.action(/move_([0-9a-fA-F\-]{36})/, async ctx => {
+  try {
+    const reqId = ctx.match[1];
+    const slots = await db.getAllSlots(pool);
+    if (!slots || slots.length === 0) return ctx.answerCbQuery('Нет свободных интервалов');
+    adminStates[ctx.from.id] = { moveReqId: reqId };
+    const buttons = slots.map(s => [Markup.button.callback(s.time, `moveTo_${s.id}`)]);
+    await ctx.reply('Выберите новое время:', Markup.inlineKeyboard(buttons));
+    await ctx.answerCbQuery();
+  } catch (e) { console.error('move_ error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
+});
+
+bot.action(/moveTo_([0-9a-fA-F\-]{36})/, async ctx => {
+  try {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+    const slotId = ctx.match[1];
+    const slot = await db.getSlotById(pool, slotId);
+    if (!slot) return ctx.answerCbQuery('Слот недоступен', { show_alert: true });
+    const st = adminStates[ctx.from.id];
+    const reqId = st && st.moveReqId;
+    if (!reqId) return ctx.answerCbQuery('Не найден запрос для переноса', { show_alert: true });
+    const req = await db.getRequestById(pool, reqId);
+    if (!req) return ctx.answerCbQuery('Заявка не найдена', { show_alert: true });
+
+    try { await db.deleteSlotById(pool, slot.id); } catch (e) {}
+
+    await db.updateRequest(pool, reqId, { pending_move_slot_id: slot.id, pending_move_time: slot.time, prev_status: req.status, status: 'move_pending' });
+
+    delete adminStates[ctx.from.id];
+
+    const kb = Markup.inlineKeyboard([
+      [Markup.button.callback('Принять', `clientMoveYes_${reqId}`), Markup.button.callback('Отклонить', `clientMoveNo_${reqId}`)]
+    ]);
+    try { await bot.telegram.sendMessage(req.user_id, `Предложен перенос вашей записи на: ${slot.time}\nПринять?`, kb); } catch (e) {}
+
+    try { await ctx.reply('Предложение на перенос отправлено клиенту.'); } catch (_) {}
+    try { await ctx.answerCbQuery(); } catch (_) {}
+  } catch (e) {
+    console.error('moveTo error', e);
+    try { await ctx.answerCbQuery('Ошибка при предложении переноса'); } catch (_) {}
+  }
+});
+
+bot.action(/clientMoveYes_([0-9a-fA-F\-]{36})/, async ctx => {
+  const reqId = ctx.match[1];
+  try {
+    const res = await db.applyClientMove(pool, reqId);
+    if (!res.ok) return ctx.answerCbQuery(res.message || 'Ошибка при применении переноса');
+    try { await ctx.editMessageText('✔ Перенос подтверждён!'); } catch (_) {}
+    try { await db.sendToAdmins(pool, bot, `✔ Клиент подтвердил перенос. Новое время: ${utils.escapeHtml(res.new_time)}`); } catch (e) {}
+    await ctx.answerCbQuery();
+  } catch (err) {
+    console.error('clientMoveYes transaction error:', err);
+    try { await ctx.answerCbQuery('Ошибка при применении переноса'); } catch (_) {}
+  }
+});
+
+bot.action(/clientMoveNo_([0-9a-fA-F\-]{36})/, async ctx => {
+  try {
+    const reqId = ctx.match[1];
+    const req = await db.getRequestById(pool, reqId);
+    if (!req || !req.pending_move_slot_id) return ctx.answerCbQuery('Нет запроса на перенос');
+    await db.updateRequest(pool, reqId, { pending_move_slot_id: null, pending_move_time: null, status: req.prev_status || req.status, prev_status: null });
+    try { await ctx.editMessageText('❌ Вы отклонили перенос.'); } catch (_) {}
+    try { await db.sendToAdmins(pool, bot, `❌ Клиент ${utils.makeUserLink(req.user_id, req.username, req.name)} отклонил перенос.`); } catch (e) {}
+    await ctx.answerCbQuery();
+  } catch (e) { console.error('clientMoveNo error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
+});
+
+// global error handling
 bot.catch((err, ctx) => {
   console.error(`Bot error for update ${ctx.update?.update_id}:`, err);
 });
 
+// graceful stop
 async function shutdown() {
-  try { await notifications.shutdown(bot); } catch (e) {}
+  try { await notifications.shutdown(bot); } catch (e) { console.error('notifications shutdown error', e); }
   try { await pool.end(); } catch (e) {}
   process.exit(0);
 }
 process.once('SIGINT', shutdown);
 process.once('SIGTERM', shutdown);
 
+// start notifications worker (hook)
 notifications.start(pool, bot);
 
+// webhook / startup
 (async () => {
   if (WEBHOOK_URL) {
     const app = express();
@@ -552,10 +775,13 @@ notifications.start(pool, bot);
     try {
       const setRes = await bot.telegram.setWebhook(`${WEBHOOK_URL}${hookPath}`);
       console.log('Webhook set result:', setRes);
-    } catch (e) {}
+    } catch (e) {
+      console.error('Failed to set webhook:', e);
+    }
     app.get('/', (req, res) => res.send('OK'));
     app.listen(PORT, () => console.log(`Express server listening on ${PORT}, webhook path ${hookPath}`));
   } else {
+    console.warn('WEBHOOK_URL / RENDER_EXTERNAL_URL not set — falling back to polling (for local dev).');
     await bot.launch();
   }
 })().catch(err => {
