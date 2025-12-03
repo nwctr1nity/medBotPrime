@@ -1,4 +1,3 @@
-contents
 const { randomUUID } = require('crypto');
 
 async function initDb(pool) {
@@ -112,7 +111,6 @@ async function getProcedureByKey(pool, key) {
   return res.rows[0] || null;
 }
 
-// requests
 async function addRequestDb(pool, req) {
   await pool.query(
     `INSERT INTO requests(id, user_id, username, name, slot_id, time, procedure, status, created_at, original_slot_id, original_slot_time, original_slot_start, original_slot_end, notification_20_sent, notification_1h_sent)
@@ -153,7 +151,6 @@ async function deleteRequestById(pool, id) {
   await pool.query('DELETE FROM requests WHERE id=$1', [id]);
 }
 
-// history
 async function addHistoryItem(pool, userId, date, procedure, status) {
   await pool.query('INSERT INTO history(user_id, date, procedure, status) VALUES($1,$2,$3,$4)', [userId, date, procedure, status]);
 }
@@ -162,7 +159,6 @@ async function getHistoryForUser(pool, userId) {
   return res.rows;
 }
 
-// patterns
 async function addPatternDb(pool, pattern) {
   await pool.query('INSERT INTO patterns(id, name, intervals) VALUES($1,$2,$3)', [pattern.id, pattern.name, pattern.intervals]);
 }
@@ -178,14 +174,6 @@ async function getPatternById(pool, id) {
   return res.rows[0] || null;
 }
 
-/**
- * applyPatternToDate
- * patternId - uuid
- * dateStr - 'YYYY-MM-DD'
- * Creates slots for each interval in pattern.intervals (format "HH:MM-HH:MM,HH:MM-HH:MM")
- * Prevents overlaps: checks slots table for overlaps and skips conflicting intervals.
- * Returns { created: number }
- */
 async function applyPatternToDate(pool, patternId, dateStr) {
   const pat = await getPatternById(pool, patternId);
   if (!pat || !pat.intervals) return { created: 0 };
@@ -215,7 +203,6 @@ async function applyPatternToDate(pool, patternId, dateStr) {
   return { created };
 }
 
-// blacklist
 async function isUserBlacklisted(pool, username) {
   if (!username) return false;
   const uname = username.replace(/^@/, '').toLowerCase();
@@ -235,7 +222,6 @@ async function getBlacklist(pool) {
   return res.rows.map(r => r.username);
 }
 
-// helper to send to admins
 async function sendToAdmins(pool, bot, text, opts = {}) {
   const ADMIN_IDS_RAW = process.env.ADMIN_IDS || String(process.env.ADMIN_ID || '');
   const ADMIN_IDS = ADMIN_IDS_RAW.split(',').map(s => s.trim()).filter(Boolean).map(s => Number(s)).filter(n => !Number.isNaN(n));
@@ -248,7 +234,6 @@ async function sendToAdmins(pool, bot, text, opts = {}) {
   }
 }
 
-// apply client-confirmed move (transactional)
 async function applyClientMove(pool, reqId) {
   const client = await pool.connect();
   try {
@@ -313,7 +298,6 @@ async function applyClientMove(pool, reqId) {
   }
 }
 
-// helper used by notifications: fetch requests needing notifications
 async function getApprovedRequestsNeedingNotifications(pool) {
   const rows = await pool.query(`
     SELECT r.*, s.start as slot_start, s.time as slot_time
@@ -357,7 +341,7 @@ module.exports = {
   getPatternsDb,
   deletePatternDb,
   getPatternById,
-  applyPatternToDate, // NEW
+  applyPatternToDate,
 
   isUserBlacklisted,
   addToBlacklist,

@@ -1,4 +1,3 @@
-contents
 const INTERVAL_MS = 60 * 1000;
 let timer = null;
 let running = false;
