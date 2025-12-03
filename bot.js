@@ -1,4 +1,3 @@
-contents
 require('dotenv').config();
 
 const { Telegraf, Markup } = require('telegraf');
@@ -56,7 +55,7 @@ const pool = new Pool({
   }
 })();
 
-const adminStates = {}; // { adminId: { mode, ... } }
+const adminStates = {};
 
 bot.start(async ctx => {
   try {
@@ -182,48 +181,6 @@ bot.action(/^proc_([0-9a-fA-F\-]{36})_(.+)$/u, async ctx => {
     console.error('proc handler error:', err);
     try { await ctx.answerCbQuery('Ошибка при создании заявки'); } catch (_) {}
   }
-});
-
-// feedback handled in text messages
-
-// history client
-bot.hears('📚 История посещений', async ctx => {
-  try {
-    const rows = await db.getHistoryForUser(pool, ctx.from.id);
-    if (!rows || rows.length === 0) return ctx.reply('История пуста.');
-    let msg = 'Ваша история:\n\n';
-    rows.forEach(h => msg += `• ${utils.escapeHtml(h.date)} — ${utils.escapeHtml(h.procedure)} (${utils.escapeHtml(h.status)})\n`);
-    await ctx.reply(msg);
-  } catch (e) { console.error('history error', e); }
-});
-
-// CRUD
-bot.action('manage_procedures', async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-  try {
-    const procs = await db.getProcedures(pool);
-    const buttons = procs.map(p => [Markup.button.callback(`Удалить ${utils.escapeHtml(p.name)}`, `delproc_${p.key}`)]);
-    buttons.push([Markup.button.callback('➕ Добавить процедуру', 'addproc')]);
-    await ctx.reply('Список процедур:', Markup.inlineKeyboard(buttons));
-    await ctx.answerCbQuery();
-  } catch (e) { console.error('manage_procedures error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
-});
-
-bot.action('addproc', async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-  adminStates[ctx.from.id] = { mode: 'addproc' };
-  await ctx.reply('Отправьте название процедуры (например: Ботулинотерапия). Я сгенерирую ключ автоматически.');
-  await ctx.answerCbQuery();
-});
-
-bot.action(/delproc_(.+)/, async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-  try {
-    const key = ctx.match[1];
-    await db.deleteProcedureDb(pool, key);
-    await ctx.reply('Процедура удалена.');
-    await ctx.answerCbQuery();
-  } catch (e) { console.error('delproc error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
 bot.on('text', async ctx => {
@@ -484,6 +441,34 @@ bot.action(/delete_([0-9a-fA-F\-]{36})/, async ctx => {
   } catch (e) { console.error('delete error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
+bot.action('manage_procedures', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  try {
+    const procs = await db.getProcedures(pool);
+    const buttons = procs.map(p => [Markup.button.callback(`Удалить ${utils.escapeHtml(p.name)}`, `delproc_${p.key}`)]);
+    buttons.push([Markup.button.callback('➕ Добавить процедуру', 'addproc')]);
+    await ctx.reply('Список процедур:', Markup.inlineKeyboard(buttons));
+    await ctx.answerCbQuery();
+  } catch (e) { console.error('manage_procedures error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
+});
+
+bot.action('addproc', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  adminStates[ctx.from.id] = { mode: 'addproc' };
+  await ctx.reply('Отправьте название процедуры (например: Ботулинотерапия). Я сгенерирую ключ автоматически.');
+  await ctx.answerCbQuery();
+});
+
+bot.action(/delproc_(.+)/, async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  try {
+    const key = ctx.match[1];
+    await db.deleteProcedureDb(pool, key);
+    await ctx.reply('Процедура удалена.');
+    await ctx.answerCbQuery();
+  } catch (e) { console.error('delproc error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
+});
+
 bot.action('manage_patterns', async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
   try {
@@ -628,7 +613,6 @@ bot.action(/no_show_([0-9a-fA-F\-]{36})/, async ctx => {
     try { await ctx.editMessageText('🚫 Отмечено как неявка'); } catch (_) {}
     try { await db.sendToAdmins(pool, bot, `🚫 Клиент ${utils.makeUserLink(req.user_id, req.username, req.name)} — не явился.\nВремя: ${utils.escapeHtml(req.time)}\nПроцедура: ${utils.escapeHtml(req.procedure || '-')}`, { parse_mode: 'HTML' }); } catch (e) { console.error('admin notify no-show', e); }
 
-
     await ctx.answerCbQuery();
   } catch (e) { console.error('no_show error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
@@ -702,7 +686,6 @@ bot.action(/clientMoveNo_([0-9a-fA-F\-]{36})/, async ctx => {
   } catch (e) { console.error('clientMoveNo error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
-// global error handling
 bot.catch((err, ctx) => {
   console.error(`Bot error for update ${ctx.update?.update_id}:`, err);
 });
