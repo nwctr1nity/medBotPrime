@@ -97,6 +97,16 @@ bot.hears('Обратная связь', async ctx => {
   } catch (e) { console.error('feedback start error', e); }
 });
 
+bot.hears('📚 История посещений', async ctx => {
+  try {
+    const rows = await db.getHistoryForUser(pool, ctx.from.id);
+    if (!rows || rows.length === 0) return ctx.reply('История пуста.');
+    let msg = 'Ваша история:\n\n';
+    rows.forEach(h => msg += `• ${utils.escapeHtml(h.date)} — ${utils.escapeHtml(h.procedure)} (${utils.escapeHtml(h.status)})\n`);
+    await ctx.reply(msg);
+  } catch (e) { console.error('history error', e); }
+});
+
 bot.action('choose_later', async ctx => {
   try {
     if (await db.isUserBlacklisted(pool, ctx.from.username)) return ctx.answerCbQuery('Нет доступа', { show_alert: true });
@@ -266,7 +276,7 @@ bot.on('text', async ctx => {
       const pats = await db.getPatternsDb(pool);
       if (!pats || pats.length === 0) {
         delete adminStates[ctx.from.id];
-        return ctx.reply('Шаблонов нет. Добавляйте шаблоны вручную в БД.');
+        return ctx.reply('Шаблонов нет. Сначала добавьте шаблон.');
       }
     
       const buttons = pats.map(p => [ Markup.button.callback(p.name + (p.intervals ? ` (${p.intervals})` : ''), `applypattern_date_${p.id}`) ]);
@@ -333,6 +343,7 @@ bot.action('req_rejected', async ctx => { if (isAdmin(ctx)) await showRequestsBy
 bot.action('req_move_pending', async ctx => { if (isAdmin(ctx)) await showRequestsByStatus(ctx, 'move_pending', '🔵 Ожидающие переноса'); else ctx.answerCbQuery('Нет доступа'); });
 bot.action('req_completed', async ctx => { if (isAdmin(ctx)) await showRequestsByStatus(ctx, 'completed', '✅ Выполненные'); else ctx.answerCbQuery('Нет доступа'); });
 bot.action('req_no_show', async ctx => { if (isAdmin(ctx)) await showRequestsByStatus(ctx, 'no_show', '🚫 Неявки'); else ctx.answerCbQuery('Нет доступа'); });
+bot.action('req_reserved', async ctx => { if (isAdmin(ctx)) await showReservedRequests(ctx); else ctx.answerCbQuery('Нет доступа'); });
 
 async function showRequestsByStatus(ctx, status, label) {
   try {
@@ -377,12 +388,39 @@ async function showRequestsByStatus(ctx, status, label) {
   }
 }
 
+async function showReservedRequests(ctx) {
+  try {
+    const list = await db.getReservedRequests(pool);
+    if (!list || list.length === 0) {
+      try { return await ctx.editMessageText(`🔷 Зарезервированные: нет заявок.`); } catch (_) { return await ctx.reply(`🔷 Зарезервированные: нет заявок.`); }
+    }
+    for (const r of list) {
+      const userLink = utils.makeUserLink(r.user_id, r.username, r.name);
+      const text = `🔷 Зарезервировано\nКлиент: ${userLink}\nРезерв: ${utils.escapeHtml(r.original_slot_time || r.time)}\nПроцедура: ${utils.escapeHtml(r.procedure || '-')}\nСтатус: ${utils.escapeHtml(r.status)}`;
+      const kb = Markup.inlineKeyboard([
+        [Markup.button.callback('✔ Подтвердить (сделать заявкой)', `confirm_reserved_${r.id}`)],
+        [Markup.button.callback('❌ Отменить', `reject_${r.id}`)]
+      ]);
+      try {
+        await ctx.replyWithHTML(text, kb);
+      } catch (e) {
+        console.error('Failed to send reserved card:', e);
+      }
+    }
+    try { await ctx.answerCbQuery(); } catch (_) {}
+  } catch (e) {
+    console.error('showReservedRequests error:', e);
+    try { await ctx.answerCbQuery('Ошибка'); } catch (_) {}
+  }
+}
+
 function adminPanelKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🟡 Ожидающие', 'req_pending')],
     [Markup.button.callback('🟢 Подтверждённые', 'req_approved')],
     [Markup.button.callback('🔴 Отклонённые', 'req_rejected')],
     [Markup.button.callback('🔵 Ожидающие переноса', 'req_move_pending')],
+    [Markup.button.callback('🔷 Зарезервированные', 'req_reserved')],
     [Markup.button.callback('✅ Выполненные', 'req_completed'), Markup.button.callback('🚫 Неявки', 'req_no_show')],
     [Markup.button.callback('🛠 Управлять процедурами', 'manage_procedures')],
     [Markup.button.callback('⚠️ Черный список', 'manage_blacklist')],
@@ -397,48 +435,21 @@ async function openAdminPanel(ctx) {
   try { await ctx.answerCbQuery(); } catch (_) {}
 }
 
-bot.action(/approve_([0-9a-fA-F\-]{36})/, async ctx => {
+bot.action(/confirm_reserved_([0-9a-fA-F\-]{36})/, async ctx => {
   try {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-    const reqId = ctx.match[1];
-    const req = await db.getRequestById(pool, reqId);
+    const id = ctx.match[1];
+    const req = await db.getRequestById(pool, id);
     if (!req) return ctx.answerCbQuery('Заявка не найдена');
-    if (req.status === 'approved') return ctx.answerCbQuery('Уже подтверждена');
-
-    await db.updateRequest(pool, reqId, { status: 'approved', notification_20_sent: false, notification_1h_sent: false });
-
-    try { await ctx.editMessageText('✔ Заявка подтверждена'); } catch (_) {}
-    try { await bot.telegram.sendMessage(req.user_id, `✔ Ваша запись на ${req.time} подтверждена!`); } catch (e) { console.error('notify user approval error', e); }
+    await db.updateRequest(pool, id, { status: 'pending' });
+    try { await ctx.editMessageText('✔ Резерв переведён в заявку'); } catch (_) {}
+    try { await bot.telegram.sendMessage(req.user_id, `Ваша резервная заявка на ${req.original_slot_time || req.time} переведена в заявку и ожидает подтверждения администратора.`); } catch (e) {}
+    try { await db.sendToAdmins(pool, bot, `📩 Резерв переведён в заявку вручную\nКлиент: ${req.username ? '@'+req.username : req.name}\nВремя: ${req.original_slot_time || req.time}\nПроцедура: ${req.procedure || '-'}`); } catch (e) {}
     await ctx.answerCbQuery();
-  } catch (e) { console.error('approve error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
-});
-
-bot.action(/reject_([0-9a-fA-F\-]{36})/, async ctx => {
-  try {
-    if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-    const reqId = ctx.match[1];
-    const req = await db.getRequestById(pool, reqId);
-    if (!req) return ctx.answerCbQuery('Заявка не найдена');
-
-    if (req.original_slot_id && req.original_slot_time && (req.original_slot_start || req.original_slot_end)) {
-      try { await db.addSlotToDb(pool, req.original_slot_id, req.original_slot_time, req.original_slot_start, req.original_slot_end); } catch (e) { console.error('Failed to restore slot on reject:', e); }
-    }
-
-    await db.updateRequest(pool, reqId, { status: 'rejected' });
-    try { await ctx.editMessageText('❌ Заявка отклонена'); } catch (_) {}
-    try { await bot.telegram.sendMessage(req.user_id, `❌ Ваша заявка на ${req.time} была отклонена.`); } catch (e) { console.error('notify reject error', e); }
-    await ctx.answerCbQuery();
-  } catch (e) { console.error('reject error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
-});
-
-bot.action(/delete_([0-9a-fA-F\-]{36})/, async ctx => {
-  try {
-    if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-    const reqId = ctx.match[1];
-    await db.deleteRequestById(pool, reqId);
-    try { await ctx.editMessageText('🗑 Заявка удалена.'); } catch (_) {}
-    await ctx.answerCbQuery();
-  } catch (e) { console.error('delete error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
+  } catch (e) {
+    console.error('confirm_reserved error', e);
+    try { await ctx.answerCbQuery('Ошибка'); } catch (_) {}
+  }
 });
 
 bot.action('manage_procedures', async ctx => {
@@ -473,12 +484,7 @@ bot.action('manage_patterns', async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
   try {
     const patterns = await db.getPatternsDb(pool);
-    if (!patterns || patterns.length === 0) {
-      await ctx.reply('Шаблонов нет. Добавляйте шаблоны вручную в БД.');
-      await ctx.answerCbQuery();
-      return;
-    }
-    const buttons = patterns.map(p => [Markup.button.callback(`Удалить ${p.name}`, `delpattern_${p.id}`), Markup.button.callback(`${p.name}${p.intervals ? ` (${p.intervals})` : ''}`, `pattern_${p.id}`)]);
+    const buttons = (patterns || []).map(p => [Markup.button.callback(`Удалить ${p.name}`, `delpattern_${p.id}`)]);
     buttons.push([Markup.button.callback('➕ Добавить шаблон', 'addpattern')]);
     buttons.push([Markup.button.callback('🗓 Применить шаблон на дату', 'applypattern_start')]);
     await ctx.reply('Шаблоны расписания:', Markup.inlineKeyboard(buttons));
