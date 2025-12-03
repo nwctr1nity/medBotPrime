@@ -15,7 +15,8 @@ function slugifyName(name) {
     .replace(/[^\p{L}\p{N}_-]+/gu, '')
     .replace(/^_+|_+$/g, '')
     .replace(/^-+|-+$/g, '');
-  return s;
+
+  return s.slice(0, 30);
 }
 
 function parseSlotDateTimeInterval(text) {
