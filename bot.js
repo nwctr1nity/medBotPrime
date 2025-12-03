@@ -26,7 +26,11 @@ const ADMIN_IDS = new Set(
 
 function isAdmin(ctxOrId) {
   const id = (typeof ctxOrId === 'object' && ctxOrId?.from?.id) ? ctxOrId.from.id : ctxOrId;
-  return ADMIN_IDS.has(Number(id));
+  const n = Number(id);
+  if (Number.isNaN(n)) return false;
+  if (ADMIN_IDS.has(n)) return true;
+  if (ADMIN_ID && n === ADMIN_ID) return true;
+  return false;
 }
 
 if (!BOT_TOKEN) {
@@ -95,16 +99,6 @@ bot.hears('Обратная связь', async ctx => {
     adminStates[ctx.from.id] = { mode: 'feedback' };
     await ctx.reply('Можете оставить свой комментарий, связанный с опытом использования моего бота.');
   } catch (e) { console.error('feedback start error', e); }
-});
-
-bot.hears('📚 История посещений', async ctx => {
-  try {
-    const rows = await db.getHistoryForUser(pool, ctx.from.id);
-    if (!rows || rows.length === 0) return ctx.reply('История пуста.');
-    let msg = 'Ваша история:\n\n';
-    rows.forEach(h => msg += `• ${utils.escapeHtml(h.date)} — ${utils.escapeHtml(h.procedure)} (${utils.escapeHtml(h.status)})\n`);
-    await ctx.reply(msg);
-  } catch (e) { console.error('history error', e); }
 });
 
 bot.action('choose_later', async ctx => {
@@ -357,9 +351,8 @@ async function showRequestsByStatus(ctx, status, label) {
       let kb;
       if (status === 'pending') {
         kb = Markup.inlineKeyboard([
-          [Markup.button.callback('✔ Подтвердить', `approve_${r.id}`)],
-          [Markup.button.callback('🔁 Перенести', `move_${r.id}`)],
-          [Markup.button.callback('❌ Отклонить', `reject_${r.id}`)]
+          [Markup.button.callback('✔ Подтвердить', `approve_${r.id}`), Markup.button.callback('❌ Отклонить', `reject_${r.id}`)],
+          [Markup.button.callback('🔁 Перенести', `move_${r.id}`)]
         ]);
       } else if (status === 'approved') {
         kb = Markup.inlineKeyboard([
@@ -435,6 +428,47 @@ async function openAdminPanel(ctx) {
   try { await ctx.answerCbQuery(); } catch (_) {}
 }
 
+bot.action(/^(approve|reject|delete)_([0-9a-fA-F\-]{36})$/, async ctx => {
+  try {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+    const cmd = ctx.match[1];
+    const reqId = ctx.match[2];
+    const req = await db.getRequestById(pool, reqId);
+    if (!req) return ctx.answerCbQuery('Заявка не найдена');
+
+    if (cmd === 'approve') {
+      await db.updateRequest(pool, reqId, { status: 'approved', notification_20_sent: false, notification_1h_sent: false });
+      try { await ctx.editMessageText('✔ Заявка подтверждена'); } catch (_) {}
+      try { await bot.telegram.sendMessage(req.user_id, `✔ Ваша запись на ${req.time} подтверждена!`); } catch (e) {}
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    if (cmd === 'reject') {
+      if (req.original_slot_id && req.original_slot_time && (req.original_slot_start || req.original_slot_end)) {
+        try { await db.addSlotToDb(pool, req.original_slot_id, req.original_slot_time, req.original_slot_start, req.original_slot_end); } catch (e) {}
+      }
+      await db.updateRequest(pool, reqId, { status: 'rejected' });
+      try { await ctx.editMessageText('❌ Заявка отклонена'); } catch (_) {}
+      try { await bot.telegram.sendMessage(req.user_id, `❌ Ваша заявка на ${req.time} была отклонена.`); } catch (e) {}
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    if (cmd === 'delete') {
+      await db.deleteRequestById(pool, reqId);
+      try { await ctx.editMessageText('🗑 Заявка удалена.'); } catch (_) {}
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    await ctx.answerCbQuery();
+  } catch (e) {
+    console.error('approve/reject/delete handler error', e);
+    try { await ctx.answerCbQuery('Ошибка'); } catch (_) {}
+  }
+});
+
 bot.action(/confirm_reserved_([0-9a-fA-F\-]{36})/, async ctx => {
   try {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
@@ -499,18 +533,6 @@ bot.action('addpattern', async ctx => {
   await ctx.answerCbQuery();
 });
 
-bot.action(/^pattern_(.+)$/, async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-  const id = ctx.match[1];
-  const pat = await db.getPatternById(pool, id);
-  if (!pat) return ctx.answerCbQuery('Шаблон не найден');
-  const kb = Markup.inlineKeyboard([
-    [Markup.button.callback('Применить на дата', `applypattern_start`)],
-  ]);
-  await ctx.reply(`Шаблон: ${pat.name}\nИнтервалы: ${pat.intervals || '-'}`, kb);
-  await ctx.answerCbQuery();
-});
-
 bot.action(/^applypattern_date_(.+)$/, async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
   try {
@@ -521,11 +543,8 @@ bot.action(/^applypattern_date_(.+)$/, async ctx => {
       await ctx.answerCbQuery('Сначала укажите дату для применения шаблона (кнопка "Применить шаблон на дату").', { show_alert: true });
       return;
     }
-
     const res = await db.applyPatternToDate(pool, patternId, dateISO);
-
     delete adminStates[ctx.from.id];
-
     try { await ctx.editMessageText(`Генерация слотов завершена. Создано: ${res.created}`); } catch (_) {}
     await ctx.answerCbQuery();
   } catch (e) {
@@ -599,8 +618,8 @@ bot.action(/complete_([0-9a-fA-F\-]{36})/, async ctx => {
     await db.addHistoryItem(pool, req.user_id, req.time, req.procedure || 'Процедура', 'Выполнено');
 
     try { await ctx.editMessageText('✅ Отмечено как выполнено'); } catch (_) {}
-    try { await bot.telegram.sendMessage(req.user_id, `✅ Ваша запись на ${req.time} помечена как выполненная.`); } catch (e) { console.error('notify complete error', e); }
-    try { await db.sendToAdmins(pool, bot, `✅ Клиент ${utils.makeUserLink(req.user_id, req.username, req.name)} — выполнено.\nВремя: ${utils.escapeHtml(req.time)}\nПроцедура: ${utils.escapeHtml(req.procedure || '-')}`, { parse_mode: 'HTML' }); } catch (e) { console.error('admin notify complete', e); }
+    try { await bot.telegram.sendMessage(req.user_id, `✅ Ваша запись на ${req.time} помечена как выполненная.`); } catch (e) {}
+    try { await db.sendToAdmins(pool, bot, `✅ Клиент ${utils.makeUserLink(req.user_id, req.username, req.name)} — выполнено.\nВремя: ${utils.escapeHtml(req.time)}\nПроцедура: ${utils.escapeHtml(req.procedure || '-')}`, { parse_mode: 'HTML' }); } catch (e) {}
 
     await ctx.answerCbQuery();
   } catch (e) { console.error('complete error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
@@ -617,7 +636,7 @@ bot.action(/no_show_([0-9a-fA-F\-]{36})/, async ctx => {
     await db.addHistoryItem(pool, req.user_id, req.time, req.procedure || 'Процедура', 'Неявка');
 
     try { await ctx.editMessageText('🚫 Отмечено как неявка'); } catch (_) {}
-    try { await db.sendToAdmins(pool, bot, `🚫 Клиент ${utils.makeUserLink(req.user_id, req.username, req.name)} — не явился.\nВремя: ${utils.escapeHtml(req.time)}\nПроцедура: ${utils.escapeHtml(req.procedure || '-')}`, { parse_mode: 'HTML' }); } catch (e) { console.error('admin notify no-show', e); }
+    try { await db.sendToAdmins(pool, bot, `🚫 Клиент ${utils.makeUserLink(req.user_id, req.username, req.name)} — не явился.\nВремя: ${utils.escapeHtml(req.time)}\nПроцедура: ${utils.escapeHtml(req.procedure || '-')}`, { parse_mode: 'HTML' }); } catch (e) {}
 
     await ctx.answerCbQuery();
   } catch (e) { console.error('no_show error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
@@ -647,7 +666,7 @@ bot.action(/moveTo_([0-9a-fA-F\-]{36})/, async ctx => {
     const req = await db.getRequestById(pool, reqId);
     if (!req) return ctx.answerCbQuery('Заявка не найдена', { show_alert: true });
 
-    try { await db.deleteSlotById(pool, slot.id); } catch (e) { console.error('Failed to delete slot while proposing move:', e); }
+    try { await db.deleteSlotById(pool, slot.id); } catch (e) {}
 
     await db.updateRequest(pool, reqId, { pending_move_slot_id: slot.id, pending_move_time: slot.time, prev_status: req.status, status: 'move_pending' });
 
@@ -656,7 +675,7 @@ bot.action(/moveTo_([0-9a-fA-F\-]{36})/, async ctx => {
     const kb = Markup.inlineKeyboard([
       [Markup.button.callback('Принять', `clientMoveYes_${reqId}`), Markup.button.callback('Отклонить', `clientMoveNo_${reqId}`)]
     ]);
-    try { await bot.telegram.sendMessage(req.user_id, `Предложен перенос вашей записи на: ${slot.time}\nПринять?`, kb); } catch (e) { console.error('notify client move proposal error', e); }
+    try { await bot.telegram.sendMessage(req.user_id, `Предложен перенос вашей записи на: ${slot.time}\nПринять?`, kb); } catch (e) {}
 
     try { await ctx.reply('Предложение на перенос отправлено клиенту.'); } catch (_) {}
     try { await ctx.answerCbQuery(); } catch (_) {}
@@ -672,7 +691,7 @@ bot.action(/clientMoveYes_([0-9a-fA-F\-]{36})/, async ctx => {
     const res = await db.applyClientMove(pool, reqId);
     if (!res.ok) return ctx.answerCbQuery(res.message || 'Ошибка при применении переноса');
     try { await ctx.editMessageText('✔ Перенос подтверждён!'); } catch (_) {}
-    try { await db.sendToAdmins(pool, bot, `✔ Клиент подтвердил перенос. Новое время: ${utils.escapeHtml(res.new_time)}`); } catch (e) { console.error('notify admin move confirmed', e); }
+    try { await db.sendToAdmins(pool, bot, `✔ Клиент подтвердил перенос. Новое время: ${utils.escapeHtml(res.new_time)}`); } catch (e) {}
     await ctx.answerCbQuery();
   } catch (err) {
     console.error('clientMoveYes transaction error:', err);
@@ -687,7 +706,7 @@ bot.action(/clientMoveNo_([0-9a-fA-F\-]{36})/, async ctx => {
     if (!req || !req.pending_move_slot_id) return ctx.answerCbQuery('Нет запроса на перенос');
     await db.updateRequest(pool, reqId, { pending_move_slot_id: null, pending_move_time: null, status: req.prev_status || req.status, prev_status: null });
     try { await ctx.editMessageText('❌ Вы отклонили перенос.'); } catch (_) {}
-    try { await db.sendToAdmins(pool, bot, `❌ Клиент ${utils.makeUserLink(req.user_id, req.username, req.name)} отклонил перенос.`); } catch (e) { console.error('notify admin reject move', e); }
+    try { await db.sendToAdmins(pool, bot, `❌ Клиент ${utils.makeUserLink(req.user_id, req.username, req.name)} отклонил перенос.`); } catch (e) {}
     await ctx.answerCbQuery();
   } catch (e) { console.error('clientMoveNo error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
@@ -697,7 +716,7 @@ bot.catch((err, ctx) => {
 });
 
 async function shutdown() {
-  try { await notifications.shutdown(bot); } catch (e) { console.error('notifications shutdown error', e); }
+  try { await notifications.shutdown(bot); } catch (e) {}
   try { await pool.end(); } catch (e) {}
   process.exit(0);
 }
@@ -714,13 +733,10 @@ notifications.start(pool, bot);
     try {
       const setRes = await bot.telegram.setWebhook(`${WEBHOOK_URL}${hookPath}`);
       console.log('Webhook set result:', setRes);
-    } catch (e) {
-      console.error('Failed to set webhook:', e);
-    }
+    } catch (e) {}
     app.get('/', (req, res) => res.send('OK'));
     app.listen(PORT, () => console.log(`Express server listening on ${PORT}, webhook path ${hookPath}`));
   } else {
-    console.warn('WEBHOOK_URL / RENDER_EXTERNAL_URL not set — falling back to polling (for local dev).');
     await bot.launch();
   }
 })().catch(err => {
