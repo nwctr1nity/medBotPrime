@@ -78,6 +78,105 @@ bot.hears('Обратная связь', async ctx => {
 
 bot.hears('🛠 Открыть панель', ctx => openAdminPanel(ctx));
 
+async function openPatternsPanel(ctx) {
+  if (!isAdmin(ctx)) return ctx.reply('Доступно только администраторам.');
+  try {
+    const patterns = await db.getPatternsDb(pool);
+    const buttons = [
+      [Markup.button.callback('➕ Добавить шаблон', 'add_pattern')],
+    ];
+    if (patterns.length > 0) {
+      for (const p of patterns) {
+        buttons.push([Markup.button.callback(`🗑 Удалить ${p.name}`, `del_pattern_${p.id}`)]);
+      }
+    } else {
+      buttons.push([Markup.button.callback('Нет шаблонов', 'noop')]);
+    }
+    await ctx.reply('Шаблоны расписания:', Markup.inlineKeyboard(buttons));
+  } catch (e) {
+    console.error('openPatternsPanel error', e);
+  }
+}
+
+bot.action('add_pattern', async ctx => {
+  try {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Недоступно', { show_alert: true });
+    adminStates[ctx.from.id] = { mode: 'adding_pattern' };
+    await ctx.reply('Введите шаблон в формате: Название | HH:MM-HH:MM,HH:MM-HH:MM\nПример: Утренние | 09:00-10:00,10:15-11:15');
+    await ctx.answerCbQuery();
+  } catch (e) { console.error('add_pattern action error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
+});
+
+bot.action(/^del_pattern_([0-9a-fA-F\-]{36})$/, async ctx => {
+  try {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Недоступно', { show_alert: true });
+    const id = ctx.match[1];
+    await db.deletePatternDb(pool, id);
+    await ctx.answerCbQuery('Шаблон удалён');
+    try { await ctx.deleteMessage(); } catch (_) {}
+    // refresh panel
+    await openPatternsPanel(ctx);
+  } catch (e) { console.error('del_pattern action error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
+});
+
+bot.action('noop', async ctx => {
+  try { await ctx.answerCbQuery(); } catch (_) {}
+});
+
+bot.hears(/.*/, async ctx => {
+  try {
+    const st = adminStates[ctx.from.id];
+    if (!st) return;
+    if (st.mode === 'adding_pattern' && isAdmin(ctx)) {
+      const text = (ctx.message && ctx.message.text) ? ctx.message.text.trim() : '';
+      const parts = text.split('|').map(s => s.trim());
+      if (parts.length !== 2) {
+        await ctx.reply('Неверный формат. Используйте: Название | HH:MM-HH:MM,HH:MM-HH:MM');
+        return;
+      }
+      const name = parts[0];
+      const intervals = parts[1].split(',').map(s => s.trim()).filter(Boolean).join(',');
+      if (!name || !intervals) {
+        await ctx.reply('Неверный формат. Название и интервалы обязательны.');
+        return;
+      }
+      const id = randomUUID();
+      await db.addPatternDb(pool, { id, name, intervals });
+      delete adminStates[ctx.from.id];
+      await ctx.reply(`Шаблон "${name}" добавлен.`);
+      try { await db.sendToAdmins(pool, bot, `➕ Добавлен шаблон: ${name}`); } catch (_) {}
+      return;
+    }
+    if (st.mode === 'feedback') {
+      delete adminStates[ctx.from.id];
+      try { await db.sendToAdmins(pool, bot, `Обратная связь от ${ctx.from.username ? '@'+ctx.from.username : ctx.from.first_name}: ${ctx.message.text}`); } catch (_) {}
+      await ctx.reply('Спасибо за отзыв!');
+      return;
+    }
+  } catch (e) {
+    console.error('generic hears handler error', e);
+  }
+});
+
+// Extend admin panel opener to include patterns button
+async function openAdminPanel(ctx) {
+  if (!isAdmin(ctx)) return ctx.reply('Доступно только администраторам.');
+  const keyboard = [
+    [Markup.button.callback('Добавить слот', 'admin_add_slot')],
+    [Markup.button.callback('Список заявок', 'admin_requests')],
+    [Markup.button.callback('Шаблоны', 'open_patterns')],
+    [Markup.button.callback('Черный список', 'admin_blacklist')]
+  ];
+  await ctx.reply('Панель администратора:', Markup.inlineKeyboard(keyboard));
+}
+
+bot.action('open_patterns', async ctx => {
+  try {
+    await openPatternsPanel(ctx);
+    await ctx.answerCbQuery();
+  } catch (e) { console.error('open_patterns action error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
+});
+
 bot.hears('📅 Свободное время', async ctx => {
   try {
     if (await db.isUserBlacklisted(pool, ctx.from.username)) return ctx.reply('Свободных интервалов пока нет.');

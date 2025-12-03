@@ -274,19 +274,23 @@ async function applyClientMove(pool, reqId) {
 
     await client.query(
       `UPDATE requests SET slot_id = $2, time = $3,
-         status = COALESCE(prev_status, $4),
+         status = $4,
          prev_status = NULL,
          pending_move_slot_id = NULL,
-         pending_move_time = NULL
+         pending_move_time = NULL,
+         original_slot_id = NULL,
+         original_slot_time = NULL,
+         original_slot_start = NULL,
+         original_slot_end = NULL
        WHERE id = $1`,
       [reqId, newSlot.id, newSlot.time, 'approved']
     );
 
     await client.query('COMMIT');
     return { ok: true, new_time: newSlot.time };
-  } catch (err) {
+  } catch (e) {
     try { await client.query('ROLLBACK'); } catch (_) {}
-    console.error('applyClientMove transaction error:', err);
+    console.error('applyClientMove transaction error:', e);
     return { ok: false, message: 'Ошибка транзакции' };
   } finally {
     client.release();
