@@ -1,3 +1,4 @@
+contents
 require('dotenv').config();
 
 const { Telegraf, Markup } = require('telegraf');
@@ -61,10 +62,10 @@ bot.start(async ctx => {
   try {
     const keyboard = [
       ['📅 Свободное время', '📝 Оставить заявку'],
-      ['📚 История посещений']
+      ['📚 История посещений', 'Обратная связь']
     ];
     if (isAdmin(ctx)) keyboard[0].push('🛠 Открыть панель');
-    await ctx.reply('Привет! Я бот записи.\nВыбери действие:', Markup.keyboard(keyboard).resize());
+    await ctx.reply('Привет! Я бот для записи! Чтобы записаться нажмите на кнопку "Оставить заявку" и дождитесь подтверждения специалиста.\n\nВажно: сразу оставить заявку можно только на самый ранний слот, это сделано для формирования более целостного расписания. Если ранние часы вам не подходят, то вам доступна опция занять более поздний слот, однако заявка будет сформирована только в том случае, если за 12 часов до записи не останется ни одного более раннего незанятого слота.\n\nТакже напоминаю, что данный бот находится в стадии открытого тестирования. Если у вас возникла проблема или опыт использования бота вас не удовлетворил, то вы можете поделиться своим мнением, нажав на кнопку "Обратная связь". Этим вы очень сильно поможете в дальнейшей разработке и улучшении бота. Благодарим за понимание!', Markup.keyboard(keyboard).resize());
   } catch (e) { console.error('start error', e); }
 });
 
@@ -85,8 +86,27 @@ bot.hears('📝 Оставить заявку', async ctx => {
     const slot = await db.getEarliestSlot(pool);
     if (!slot) return ctx.reply('Нет доступных интервалов.');
     const buttons = [[Markup.button.callback(slot.time, `req_${slot.id}`)]];
+    buttons.push([Markup.button.callback('Выбрать более поздний слот', 'choose_later')]);
     await ctx.reply('Выбери интервал:', Markup.inlineKeyboard(buttons));
   } catch (e) { console.error('start request error', e); }
+});
+
+bot.hears('Обратная связь', async ctx => {
+  try {
+    adminStates[ctx.from.id] = { mode: 'feedback' };
+    await ctx.reply('Можете оставить свой комментарий, связанный с опытом использования моего бота.');
+  } catch (e) { console.error('feedback start error', e); }
+});
+
+bot.action('choose_later', async ctx => {
+  try {
+    if (await db.isUserBlacklisted(pool, ctx.from.username)) return ctx.answerCbQuery('Нет доступа', { show_alert: true });
+    const slots = await db.getAllSlots(pool);
+    if (!slots || slots.length === 0) return ctx.answerCbQuery('Нет доступных интервалов', { show_alert: true });
+    const buttons = slots.map(s => [Markup.button.callback(s.time, `req_${s.id}`)]);
+    await ctx.reply('Выберите желаемый интервал (поздний выбор будет резервировать слот для вас):', Markup.inlineKeyboard(buttons));
+    await ctx.answerCbQuery();
+  } catch (e) { console.error('choose_later error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
 bot.action(/req_([0-9a-fA-F\-]{36})/, async ctx => {
@@ -125,7 +145,12 @@ bot.action(/^proc_([0-9a-fA-F\-]{36})_(.+)$/u, async ctx => {
     const dup = await db.checkDuplicateRequest(pool, ctx.from.id, slotId);
     if (dup) return ctx.answerCbQuery('Вы уже отправляли заявку на этот слот.', { show_alert: true });
 
+    const earliest = await db.getEarliestSlot(pool);
+    let isEarliest = earliest && earliest.id === slot.id;
+
     try { await db.deleteSlotById(pool, slot.id); } catch (e) { console.error('Failed to delete slot while reserving:', e); }
+
+    const status = isEarliest ? 'pending' : 'reserved_later';
 
     const req = {
       id: randomUUID(),
@@ -135,7 +160,7 @@ bot.action(/^proc_([0-9a-fA-F\-]{36})_(.+)$/u, async ctx => {
       slotId: slot.id,
       time: slot.time,
       procedure: proc.name,
-      status: 'pending',
+      status: status,
       createdAt: new Date().toISOString(),
       original_slot_id: slot.id,
       original_slot_time: slot.time,
@@ -144,8 +169,13 @@ bot.action(/^proc_([0-9a-fA-F\-]{36})_(.+)$/u, async ctx => {
     };
     await db.addRequestDb(pool, req);
 
-    await ctx.reply('Заявка отправлена! Ожидайте подтверждения от администратора.');
-    try { await db.sendToAdmins(pool, bot, `📩 Новая заявка\nКлиент: ${ctx.from.username ? '@'+ctx.from.username : ctx.from.first_name}\nВремя: ${slot.time}\nПроцедура: ${proc.name}`); } catch (notifyErr) { console.error('notify admin failed', notifyErr); }
+    if (status === 'pending') {
+      await ctx.reply('Заявка отправлена! Ожидайте подтверждения от администратора.');
+      try { await db.sendToAdmins(pool, bot, `📩 Новая заявка\nКлиент: ${ctx.from.username ? '@'+ctx.from.username : ctx.from.first_name}\nВремя: ${slot.time}\nПроцедура: ${proc.name}`); } catch (notifyErr) { console.error('notify admin failed', notifyErr); }
+    } else {
+      await ctx.reply('Слот зарезервирован за вами. Если более ранние слоты займут другие клиенты и до записи останется менее 3 часов, ваша заявка автоматически будет сформирована и отправлена на подтверждение администратора.');
+      try { await db.sendToAdmins(pool, bot, `🕒 Резерв позднего слота\nКлиент: ${ctx.from.username ? '@'+ctx.from.username : ctx.from.first_name}\nРезерв: ${slot.time}\nПроцедура: ${proc.name}`); } catch (notifyErr) { console.error('notify admin failed', notifyErr); }
+    }
 
     await ctx.answerCbQuery();
   } catch (err) {
@@ -153,6 +183,8 @@ bot.action(/^proc_([0-9a-fA-F\-]{36})_(.+)$/u, async ctx => {
     try { await ctx.answerCbQuery('Ошибка при создании заявки'); } catch (_) {}
   }
 });
+
+// feedback handled in text messages
 
 // history client
 bot.hears('📚 История посещений', async ctx => {
@@ -197,8 +229,18 @@ bot.action(/delproc_(.+)/, async ctx => {
 bot.on('text', async ctx => {
   try {
     const st = adminStates[ctx.from.id];
-    if (!st) return;
     const text = ctx.message.text.trim();
+
+    if (st && st.mode === 'feedback') {
+      const uname = ctx.from.username ? '@' + ctx.from.username : ctx.from.first_name;
+      try {
+        await db.sendToAdmins(pool, bot, `📝 Обратная связь от ${uname}:\n\n${text}`);
+      } catch (e) { console.error('notify admin feedback', e); }
+      delete adminStates[ctx.from.id];
+      return await ctx.reply('Спасибо! Ваше сообщение отправлено администраторам.');
+    }
+
+    if (!st) return;
 
     if (st.mode === 'addproc') {
       const rawKey = utils.slugifyName(text);
@@ -273,6 +315,26 @@ bot.on('text', async ctx => {
       const buttons = pats.map(p => [ Markup.button.callback(p.name + (p.intervals ? ` (${p.intervals})` : ''), `applypattern_date_${p.id}`) ]);
       await ctx.reply('Выберите шаблон для применения на указанную дату:', Markup.inlineKeyboard(buttons));
       return;
+    }
+
+    if (st.mode === 'addpattern_wait_name') {
+      adminStates[ctx.from.id] = { mode: 'addpattern_wait_intervals', pattern_name: text };
+      return ctx.reply('Отправьте интервалы шаблона в формате HH:MM-HH:MM,HH:MM-HH:MM (через запятую).');
+    }
+
+    if (st.mode === 'addpattern_wait_intervals') {
+      const name = st.pattern_name || 'Шаблон';
+      const intervals = text.trim();
+      const pat = { id: randomUUID(), name, intervals };
+      try {
+        await db.addPatternDb(pool, pat);
+        delete adminStates[ctx.from.id];
+        return ctx.reply(`Шаблон "${name}" добавлен.`);
+      } catch (e) {
+        delete adminStates[ctx.from.id];
+        console.error('addpattern error', e);
+        return ctx.reply('Ошибка при добавлении шаблона.');
+      }
     }
 
   } catch (e) {
@@ -358,7 +420,6 @@ async function showRequestsByStatus(ctx, status, label) {
   }
 }
 
-// admin panel keyboard (no patterns)
 function adminPanelKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🟡 Ожидающие', 'req_pending')],
@@ -379,7 +440,6 @@ async function openAdminPanel(ctx) {
   try { await ctx.answerCbQuery(); } catch (_) {}
 }
 
-// approve/reject/delete flows (unchanged except uses db hooks)
 bot.action(/approve_([0-9a-fA-F\-]{36})/, async ctx => {
   try {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
@@ -424,7 +484,6 @@ bot.action(/delete_([0-9a-fA-F\-]{36})/, async ctx => {
   } catch (e) { console.error('delete error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
-// patterns management: show patterns and allow applying via date
 bot.action('manage_patterns', async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
   try {
@@ -434,17 +493,18 @@ bot.action('manage_patterns', async ctx => {
       await ctx.answerCbQuery();
       return;
     }
-    const buttons = patterns.map(p => [Markup.button.callback(`${p.name}${p.intervals ? ` (${p.intervals})` : ''}`, `pattern_${p.id}`)]);
+    const buttons = patterns.map(p => [Markup.button.callback(`Удалить ${p.name}`, `delpattern_${p.id}`), Markup.button.callback(`${p.name}${p.intervals ? ` (${p.intervals})` : ''}`, `pattern_${p.id}`)]);
+    buttons.push([Markup.button.callback('➕ Добавить шаблон', 'addpattern')]);
     buttons.push([Markup.button.callback('🗓 Применить шаблон на дату', 'applypattern_start')]);
     await ctx.reply('Шаблоны расписания:', Markup.inlineKeyboard(buttons));
     await ctx.answerCbQuery();
   } catch (e) { console.error('manage_patterns error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
-bot.action('applypattern_start', async ctx => {
+bot.action('addpattern', async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-  adminStates[ctx.from.id] = { mode: 'applypattern_wait_date' };
-  await ctx.reply('Отправьте дату в формате DD.MM.YYYY для применения шаблона:');
+  adminStates[ctx.from.id] = { mode: 'addpattern_wait_name' };
+  await ctx.reply('Отправьте название шаблона:');
   await ctx.answerCbQuery();
 });
 
@@ -483,6 +543,26 @@ bot.action(/^applypattern_date_(.+)$/, async ctx => {
   }
 });
 
+bot.action('applypattern_start', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  adminStates[ctx.from.id] = { mode: 'applypattern_wait_date' };
+  await ctx.reply('Отправьте дату в формате DD.MM.YYYY для применения шаблона:');
+  await ctx.answerCbQuery();
+});
+
+bot.action(/delpattern_(.+)/, async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  const id = ctx.match[1];
+  try {
+    await db.deletePatternDb(pool, id);
+    await ctx.reply('Шаблон удалён.');
+    await ctx.answerCbQuery();
+  } catch (e) {
+    console.error('delpattern error', e);
+    try { await ctx.answerCbQuery('Ошибка при удалении шаблона'); } catch (_) {}
+  }
+});
+
 bot.action('manage_blacklist', async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
   try {
@@ -517,7 +597,6 @@ bot.action(/delblack_(.+)/, async ctx => {
   }
 });
 
-// complete / no_show
 bot.action(/complete_([0-9a-fA-F\-]{36})/, async ctx => {
   try {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
@@ -554,7 +633,6 @@ bot.action(/no_show_([0-9a-fA-F\-]{36})/, async ctx => {
   } catch (e) { console.error('no_show error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
-// moving requests (unchanged)
 bot.action(/move_([0-9a-fA-F\-]{36})/, async ctx => {
   try {
     const reqId = ctx.match[1];
@@ -567,7 +645,37 @@ bot.action(/move_([0-9a-fA-F\-]{36})/, async ctx => {
   } catch (e) { console.error('move_ error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
-// client confirms move
+bot.action(/moveTo_([0-9a-fA-F\-]{36})/, async ctx => {
+  try {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+    const slotId = ctx.match[1];
+    const slot = await db.getSlotById(pool, slotId);
+    if (!slot) return ctx.answerCbQuery('Слот недоступен', { show_alert: true });
+    const st = adminStates[ctx.from.id];
+    const reqId = st && st.moveReqId;
+    if (!reqId) return ctx.answerCbQuery('Не найден запрос для переноса', { show_alert: true });
+    const req = await db.getRequestById(pool, reqId);
+    if (!req) return ctx.answerCbQuery('Заявка не найдена', { show_alert: true });
+
+    try { await db.deleteSlotById(pool, slot.id); } catch (e) { console.error('Failed to delete slot while proposing move:', e); }
+
+    await db.updateRequest(pool, reqId, { pending_move_slot_id: slot.id, pending_move_time: slot.time, prev_status: req.status, status: 'move_pending' });
+
+    delete adminStates[ctx.from.id];
+
+    const kb = Markup.inlineKeyboard([
+      [Markup.button.callback('Принять', `clientMoveYes_${reqId}`), Markup.button.callback('Отклонить', `clientMoveNo_${reqId}`)]
+    ]);
+    try { await bot.telegram.sendMessage(req.user_id, `Предложен перенос вашей записи на: ${slot.time}\nПринять?`, kb); } catch (e) { console.error('notify client move proposal error', e); }
+
+    try { await ctx.reply('Предложение на перенос отправлено клиенту.'); } catch (_) {}
+    try { await ctx.answerCbQuery(); } catch (_) {}
+  } catch (e) {
+    console.error('moveTo error', e);
+    try { await ctx.answerCbQuery('Ошибка при предложении переноса'); } catch (_) {}
+  }
+});
+
 bot.action(/clientMoveYes_([0-9a-fA-F\-]{36})/, async ctx => {
   const reqId = ctx.match[1];
   try {
@@ -599,7 +707,6 @@ bot.catch((err, ctx) => {
   console.error(`Bot error for update ${ctx.update?.update_id}:`, err);
 });
 
-// graceful stop
 async function shutdown() {
   try { await notifications.shutdown(bot); } catch (e) { console.error('notifications shutdown error', e); }
   try { await pool.end(); } catch (e) {}
@@ -608,10 +715,8 @@ async function shutdown() {
 process.once('SIGINT', shutdown);
 process.once('SIGTERM', shutdown);
 
-// start notifications worker (hook)
 notifications.start(pool, bot);
 
-// webhook / startup
 (async () => {
   if (WEBHOOK_URL) {
     const app = express();

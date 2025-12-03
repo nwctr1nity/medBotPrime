@@ -1,3 +1,4 @@
+contents
 const INTERVAL_MS = 60 * 1000;
 let timer = null;
 let running = false;
@@ -51,6 +52,26 @@ function start(pool, bot) {
           }
         }
       }
+
+      const reserved = await db.getReservedRequests(pool);
+      for (const r of reserved) {
+        if (!r.original_slot_start) continue;
+        const slotStart = new Date(r.original_slot_start);
+        const cutoff = new Date(slotStart.getTime() - 3 * 60 * 60 * 1000);
+        const now2 = new Date();
+        const earlierSlotsRes = await pool.query('SELECT 1 FROM slots WHERE start < $1 LIMIT 1', [r.original_slot_start]);
+        const hasEarlier = earlierSlotsRes.rowCount > 0;
+        if (!hasEarlier || now2 >= cutoff) {
+          try {
+            await db.updateRequest(pool, r.id, { status: 'pending' });
+            try { await bot.telegram.sendMessage(r.user_id, `Ваша резервная заявка на ${r.original_slot_time} переведена в заявку и ожидает подтверждения администратора.`); } catch (e) {}
+            try { await db.sendToAdmins(pool, bot, `📩 Резерв переведён в заявку\nКлиент: ${r.username ? '@'+r.username : r.name}\nВремя: ${r.original_slot_time}\nПроцедура: ${r.procedure || '-'}`); } catch (e) {}
+          } catch (e) {
+            console.error('error converting reserved to pending for', r.id, e);
+          }
+        }
+      }
+
     } catch (e) {
       console.error('notificationWorker error', e);
     }

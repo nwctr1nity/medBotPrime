@@ -1,3 +1,4 @@
+contents
 const { randomUUID } = require('crypto');
 
 async function initDb(pool) {
@@ -202,7 +203,6 @@ async function applyPatternToDate(pool, patternId, dateStr) {
     const end = new Date(Date.UTC(year, month - 1, day, eh, em, 0, 0));
     if (end.getTime() <= start.getTime()) continue;
 
-    // check overlap: slots where NOT (start >= end_new OR end <= start_new)
     const overlapRes = await pool.query('SELECT 1 FROM slots WHERE NOT (start >= $1 OR "end" <= $2) LIMIT 1', [end.toISOString(), start.toISOString()]);
     if (overlapRes.rowCount === 0) {
       const timeStr = `${String(start.getUTCDate()).padStart(2,'0')}.${String(start.getUTCMonth()+1).padStart(2,'0')}.${start.getUTCFullYear()} ${String(start.getUTCHours()).padStart(2,'0')}:${String(start.getUTCMinutes()).padStart(2,'0')}-${String(end.getUTCHours()).padStart(2,'0')}:${String(end.getUTCMinutes()).padStart(2,'0')}`;
@@ -263,14 +263,6 @@ async function applyClientMove(pool, reqId) {
 
     const slotRes = await client.query('SELECT * FROM slots WHERE id=$1 FOR UPDATE', [req.pending_move_slot_id]);
     const newSlot = slotRes.rows[0];
-    if (!newSlot) {
-      await client.query(
-        `UPDATE requests SET pending_move_slot_id = NULL, pending_move_time = NULL, status = COALESCE(prev_status, status), prev_status = NULL
-         WHERE id = $1`, [reqId]
-      );
-      await client.query('COMMIT');
-      return { ok: false, message: 'Выбранный слот уже недоступен' };
-    }
 
     if (req.prev_status === 'approved' && req.original_slot_id && (req.original_slot_start || req.original_slot_end)) {
       try {
@@ -282,6 +274,20 @@ async function applyClientMove(pool, reqId) {
       } catch (e) {
         console.error('Failed to re-add original slot (best-effort):', e);
       }
+    }
+
+    if (!newSlot) {
+      await client.query(
+        `UPDATE requests SET slot_id = $2, time = $3,
+           status = COALESCE(prev_status, $4),
+           prev_status = NULL,
+           pending_move_slot_id = NULL,
+           pending_move_time = NULL
+         WHERE id = $1`,
+        [reqId, req.pending_move_slot_id, req.pending_move_time, 'approved']
+      );
+      await client.query('COMMIT');
+      return { ok: true, new_time: req.pending_move_time };
     }
 
     await client.query('DELETE FROM slots WHERE id=$1', [newSlot.id]);
@@ -316,6 +322,11 @@ async function getApprovedRequestsNeedingNotifications(pool) {
     WHERE r.status = 'approved' AND (COALESCE(r.notification_20_sent,false) = false OR COALESCE(r.notification_1h_sent,false) = false)
   `);
   return rows.rows;
+}
+
+async function getReservedRequests(pool) {
+  const res = await pool.query('SELECT * FROM requests WHERE status=$1 ORDER BY created_at', ['reserved_later']);
+  return res.rows;
 }
 
 module.exports = {
@@ -355,5 +366,6 @@ module.exports = {
 
   sendToAdmins,
   applyClientMove,
-  getApprovedRequestsNeedingNotifications
+  getApprovedRequestsNeedingNotifications,
+  getReservedRequests
 };
