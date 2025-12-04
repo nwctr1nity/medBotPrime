@@ -59,7 +59,7 @@ const pool = new Pool({
   }
 })();
 
-const adminStates = {}; // session maps per admin/user
+const adminStates = {};
 
 bot.start(async ctx => {
   try {
@@ -101,17 +101,6 @@ bot.hears('Обратная связь', async ctx => {
   } catch (e) { console.error('feedback start error', e); }
 });
 
-bot.hears('📚 История посещений', async ctx => {
-  try {
-    const rows = await db.getHistoryForUser(pool, ctx.from.id);
-    if (!rows || rows.length === 0) return ctx.reply('История пуста.');
-    let msg = 'Ваша история:\n\n';
-    rows.forEach(h => msg += `• ${utils.escapeHtml(h.date)} — ${utils.escapeHtml(h.procedure)} (${utils.escapeHtml(h.status)})\n`);
-    await ctx.reply(msg);
-  } catch (e) { console.error('history error', e); }
-});
-
-// choose later list of slots
 bot.action('choose_later', async ctx => {
   try {
     if (await db.isUserBlacklisted(pool, ctx.from.username)) return ctx.answerCbQuery('Нет доступа', { show_alert: true });
@@ -123,7 +112,6 @@ bot.action('choose_later', async ctx => {
   } catch (e) { console.error('choose_later error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
-// request flow: show procedures (use index map to avoid long callback_data)
 bot.action(/req_([0-9a-fA-F\-]{36})/, async ctx => {
   try {
     if (await db.isUserBlacklisted(pool, ctx.from.username)) return ctx.answerCbQuery('Свободных интервалов пока нет.', { show_alert: true });
@@ -135,41 +123,26 @@ bot.action(/req_([0-9a-fA-F\-]{36})/, async ctx => {
     adminStates[ctx.from.id].choosingSlotId = slotId;
 
     const procs = await db.getProcedures(pool);
-    if (!procs || procs.length === 0) {
+    const procButtons = procs.map(p => [Markup.button.callback(p.name, `proc_${slotId}_${p.key}`)]);
+    if (procButtons.length === 0) {
       await ctx.reply('Процедур пока нет. Попросите администратора добавить процедуру.');
-      await ctx.answerCbQuery();
-      return;
+    } else {
+      await ctx.reply('Выберите процедуру:', Markup.inlineKeyboard(procButtons));
     }
-
-    // create map index -> key for this user session
-    const procMap = {};
-    const procButtons = procs.map((p, i) => {
-      procMap[i] = p.key;
-      return [Markup.button.callback(p.name, `proc_${slotId}_${i}`)];
-    });
-    adminStates[ctx.from.id].procMap = procMap;
-
-    await ctx.reply('Выберите процедуру:', Markup.inlineKeyboard(procButtons));
     await ctx.answerCbQuery();
   } catch (e) { console.error('req action error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
-// proc selection: resolve index -> key
 bot.action(/^proc_([0-9a-fA-F\-]{36})_(.+)$/u, async ctx => {
   try {
     if (await db.isUserBlacklisted(pool, ctx.from.username)) return ctx.answerCbQuery('Свободных интервалов пока нет.', { show_alert: true });
     const slotId = ctx.match[1];
-    let procKeyOrIdx = ctx.match[2];
-
-    const st = adminStates[ctx.from.id] || {};
-    if (/^\d+$/.test(procKeyOrIdx) && st.procMap && st.procMap[procKeyOrIdx] !== undefined) {
-      procKeyOrIdx = st.procMap[procKeyOrIdx];
-    }
+    const procKey = ctx.match[2];
 
     const slot = await db.getSlotById(pool, slotId);
     if (!slot) return ctx.answerCbQuery('Слот стал недоступен', { show_alert: true });
 
-    const proc = await db.getProcedureByKey(pool, procKeyOrIdx);
+    const proc = await db.getProcedureByKey(pool, procKey);
     if (!proc) return ctx.answerCbQuery('Процедура недоступна', { show_alert: true });
 
     const dup = await db.checkDuplicateRequest(pool, ctx.from.id, slotId);
@@ -231,7 +204,8 @@ bot.on('text', async ctx => {
     if (!st) return;
 
     if (st.mode === 'addproc') {
-      const key = `proc_${randomUUID().slice(0,8)}`;
+      const rawKey = utils.slugifyName(text);
+      const key = rawKey || `proc_${randomUUID().slice(0,8)}`;
       try {
         await db.addProcedureDb(pool, key, text);
         delete adminStates[ctx.from.id];
@@ -291,31 +265,21 @@ bot.on('text', async ctx => {
         return ctx.reply('Неверный формат даты. Ожидается DD.MM.YYYY');
       }
       const dateISO = `${d.year}-${String(d.month).padStart(2,'0')}-${String(d.day).padStart(2,'0')}`;
-      // save apply_date and switch to choose mode
-      adminStates[ctx.from.id] = adminStates[ctx.from.id] || {};
-      adminStates[ctx.from.id].mode = 'applypattern_choose';
-      adminStates[ctx.from.id].apply_date = dateISO;
-
+      adminStates[ctx.from.id] = { mode: 'applypattern_choose', apply_date: dateISO };
+    
       const pats = await db.getPatternsDb(pool);
       if (!pats || pats.length === 0) {
         delete adminStates[ctx.from.id];
         return ctx.reply('Шаблонов нет. Сначала добавьте шаблон.');
       }
-
-      // build index map for patterns to keep callback_data short
-      const map = {};
-      const buttons = pats.map((p, i) => {
-        map[i] = p.id;
-        return [Markup.button.callback(p.name + (p.intervals ? ` (${p.intervals})` : ''), `applypatternidx_${i}`)];
-      });
-      adminStates[ctx.from.id].managePatternMap = map;
-
+    
+      const buttons = pats.map(p => [ Markup.button.callback(p.name + (p.intervals ? ` (${p.intervals})` : ''), `applypattern_date_${p.id}`) ]);
       await ctx.reply('Выберите шаблон для применения на указанную дату:', Markup.inlineKeyboard(buttons));
       return;
     }
 
     if (st.mode === 'addpattern_wait_name') {
-      adminStates[ctx.from.id] = Object.assign(adminStates[ctx.from.id] || {}, { mode: 'addpattern_wait_intervals', pattern_name: text });
+      adminStates[ctx.from.id] = { mode: 'addpattern_wait_intervals', pattern_name: text };
       return ctx.reply('Отправьте интервалы шаблона в формате HH:MM-HH:MM,HH:MM-HH:MM (через запятую).');
     }
 
@@ -367,7 +331,6 @@ bot.action(/delslot_([0-9a-fA-F\-]{36})/, async ctx => {
   } catch (e) { console.error('delslot error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
-// requests listing shortcuts
 bot.action('req_pending', async ctx => { if (isAdmin(ctx)) await showRequestsByStatus(ctx, 'pending', '🟡 Ожидающие'); else ctx.answerCbQuery('Нет доступа'); });
 bot.action('req_approved', async ctx => { if (isAdmin(ctx)) await showRequestsByStatus(ctx, 'approved', '🟢 Подтверждённые'); else ctx.answerCbQuery('Нет доступа'); });
 bot.action('req_rejected', async ctx => { if (isAdmin(ctx)) await showRequestsByStatus(ctx, 'rejected', '🔴 Отклонённые'); else ctx.answerCbQuery('Нет доступа'); });
@@ -444,7 +407,6 @@ async function showReservedRequests(ctx) {
   }
 }
 
-// admin panel
 function adminPanelKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🟡 Ожидающие', 'req_pending')],
@@ -466,7 +428,6 @@ async function openAdminPanel(ctx) {
   try { await ctx.answerCbQuery(); } catch (_) {}
 }
 
-// unified approve/reject/delete handler
 bot.action(/^(approve|reject|delete)_([0-9a-fA-F\-]{36})$/, async ctx => {
   try {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
@@ -508,97 +469,101 @@ bot.action(/^(approve|reject|delete)_([0-9a-fA-F\-]{36})$/, async ctx => {
   }
 });
 
-// ---- Patterns management (fixed: index-mapped buttons + apply-on-date flow) ----
-
-// manage_patterns: show delete buttons only, plus add/apply
-bot.action('manage_patterns', async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+bot.action(/confirm_reserved_([0-9a-fA-F\-]{36})/, async ctx => {
   try {
-    const patterns = await db.getPatternsDb(pool);
-    const map = {};
-    const buttons = (patterns || []).map((p, i) => {
-      const idx = String(i);
-      map[idx] = p.id;
-      return [Markup.button.callback(`Удалить ${p.name}`, `delpatternidx_${idx}`)];
-    });
-    buttons.push([Markup.button.callback('➕ Добавить шаблон', 'addpattern')]);
-    buttons.push([Markup.button.callback('🗓 Применить шаблон на дату', 'applypattern_start')]);
-
-    adminStates[ctx.from.id] = adminStates[ctx.from.id] || {};
-    adminStates[ctx.from.id].managePatternMap = map;
-
-    await ctx.reply('Шаблоны расписания:', Markup.inlineKeyboard(buttons));
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+    const id = ctx.match[1];
+    const req = await db.getRequestById(pool, id);
+    if (!req) return ctx.answerCbQuery('Заявка не найдена');
+    await db.updateRequest(pool, id, { status: 'pending' });
+    try { await ctx.editMessageText('✔ Резерв переведён в заявку'); } catch (_) {}
+    try { await bot.telegram.sendMessage(req.user_id, `Ваша резервная заявка на ${req.original_slot_time || req.time} переведена в заявку и ожидает подтверждения администратора.`); } catch (e) {}
+    try { await db.sendToAdmins(pool, bot, `📩 Резерв переведён в заявку вручную\nКлиент: ${req.username ? '@'+req.username : req.name}\nВремя: ${req.original_slot_time || req.time}\nПроцедура: ${req.procedure || '-'}`); } catch (e) {}
     await ctx.answerCbQuery();
   } catch (e) {
-    console.error('manage_patterns error', e);
+    console.error('confirm_reserved error', e);
     try { await ctx.answerCbQuery('Ошибка'); } catch (_) {}
   }
 });
 
-// delete pattern by index
-bot.action(/^delpatternidx_(\d+)$/, async ctx => {
+bot.action('manage_procedures', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
   try {
-    if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-    const idx = ctx.match[1];
-    const map = adminStates[ctx.from.id] && adminStates[ctx.from.id].managePatternMap;
-    if (!map) return ctx.answerCbQuery('Сессия устарела. Откройте "Шаблоны" снова.', { show_alert: true });
-    const patternId = map[idx];
-    if (!patternId) return ctx.answerCbQuery('Не удалось найти шаблон для удаления.', { show_alert: true });
-    await db.deletePatternDb(pool, patternId);
-    try { await ctx.reply('Шаблон удалён.'); } catch (_) {}
+    const procs = await db.getProcedures(pool);
+    const buttons = procs.map(p => [Markup.button.callback(`Удалить ${utils.escapeHtml(p.name)}`, `delproc_${p.key}`)]);
+    buttons.push([Markup.button.callback('➕ Добавить процедуру', 'addproc')]);
+    await ctx.reply('Список процедур:', Markup.inlineKeyboard(buttons));
     await ctx.answerCbQuery();
-  } catch (e) {
-    console.error('delpatternidx error', e);
-    try { await ctx.answerCbQuery('Ошибка при удалении шаблона'); } catch (_) {}
-  }
+  } catch (e) { console.error('manage_procedures error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
-// add pattern: two-step
+bot.action('addproc', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  adminStates[ctx.from.id] = { mode: 'addproc' };
+  await ctx.reply('Отправьте название процедуры (например: Ботулинотерапия). Я сгенерирую ключ автоматически.');
+  await ctx.answerCbQuery();
+});
+
+bot.action(/delproc_(.+)/, async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  try {
+    const key = ctx.match[1];
+    await db.deleteProcedureDb(pool, key);
+    await ctx.reply('Процедура удалена.');
+    await ctx.answerCbQuery();
+  } catch (e) { console.error('delproc error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
+});
+
+bot.action('manage_patterns', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  try {
+    const patterns = await db.getPatternsDb(pool);
+    const buttons = (patterns || []).map(p => [Markup.button.callback(`Удалить ${p.name}`, `delpattern_${p.id}`)]);
+    buttons.push([Markup.button.callback('➕ Добавить шаблон', 'addpattern')]);
+    buttons.push([Markup.button.callback('🗓 Применить шаблон на дату', 'applypattern_start')]);
+    await ctx.reply('Шаблоны расписания:', Markup.inlineKeyboard(buttons));
+    await ctx.answerCbQuery();
+  } catch (e) { console.error('manage_patterns error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
+});
+
 bot.action('addpattern', async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-  adminStates[ctx.from.id] = Object.assign(adminStates[ctx.from.id] || {}, { mode: 'addpattern_wait_name' });
+  adminStates[ctx.from.id] = { mode: 'addpattern_wait_name' };
   await ctx.reply('Отправьте название шаблона:');
   await ctx.answerCbQuery();
 });
 
-// start apply pattern on date flow
-bot.action('applypattern_start', async ctx => {
+bot.action(/^applypattern_date_(.+)$/, async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-  adminStates[ctx.from.id] = Object.assign(adminStates[ctx.from.id] || {}, { mode: 'applypattern_wait_date' });
-  await ctx.reply('Отправьте дату в формате DD.MM.YYYY для применения шаблона:');
-  await ctx.answerCbQuery();
-});
-
-// applypattern index handler (after date + list shown)
-bot.action(/^applypatternidx_(\d+)$/, async ctx => {
   try {
-    if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-    const idx = ctx.match[1];
-    const st = adminStates[ctx.from.id] || {};
-    const map = st.managePatternMap;
-    const dateISO = st.apply_date;
-    if (!map || !dateISO) return ctx.answerCbQuery('Сессия устарела. Повторите шаги: нажмите "Применить шаблон на дату".', { show_alert: true });
-    const patternId = map[idx];
-    if (!patternId) return ctx.answerCbQuery('Не удалось определить шаблон.', { show_alert: true });
-
+    const patternId = ctx.match[1];
+    const st = adminStates[ctx.from.id];
+    const dateISO = st && st.apply_date;
+    if (!dateISO) {
+      await ctx.answerCbQuery('Сначала укажите дату для применения шаблона (кнопка "Применить шаблон на дату").', { show_alert: true });
+      return;
+    }
     const res = await db.applyPatternToDate(pool, patternId, dateISO);
-    delete adminStates[ctx.from.id].apply_date;
-    delete adminStates[ctx.from.id].managePatternMap;
-    delete adminStates[ctx.from.id].mode;
-
-    try { await ctx.reply(`Генерация слотов завершена. Создано: ${res.created}`); } catch (_) {}
+    delete adminStates[ctx.from.id];
+    try { await ctx.editMessageText(`Генерация слотов завершена. Создано: ${res.created}`); } catch (_) {}
     await ctx.answerCbQuery();
   } catch (e) {
-    console.error('applypatternidx error', e);
+    console.error('applypattern_date handler error', e);
     try { await ctx.answerCbQuery('Ошибка при применении шаблона'); } catch (_) {}
   }
 });
 
-// fallback direct delpattern_ (keeps backward compat)
+bot.action('applypattern_start', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  adminStates[ctx.from.id] = { mode: 'applypattern_wait_date' };
+  await ctx.reply('Отправьте дату в формате DD.MM.YYYY для применения шаблона:');
+  await ctx.answerCbQuery();
+});
+
 bot.action(/delpattern_(.+)/, async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  const id = ctx.match[1];
   try {
-    const id = ctx.match[1];
     await db.deletePatternDb(pool, id);
     await ctx.reply('Шаблон удалён.');
     await ctx.answerCbQuery();
@@ -607,8 +572,6 @@ bot.action(/delpattern_(.+)/, async ctx => {
     try { await ctx.answerCbQuery('Ошибка при удалении шаблона'); } catch (_) {}
   }
 });
-
-// ---- blacklist and other handlers unchanged ----
 
 bot.action('manage_blacklist', async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
@@ -644,7 +607,6 @@ bot.action(/delblack_(.+)/, async ctx => {
   }
 });
 
-// moves, confirms and notifications (unchanged logic)
 bot.action(/complete_([0-9a-fA-F\-]{36})/, async ctx => {
   try {
     if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
@@ -749,24 +711,20 @@ bot.action(/clientMoveNo_([0-9a-fA-F\-]{36})/, async ctx => {
   } catch (e) { console.error('clientMoveNo error', e); try { await ctx.answerCbQuery('Ошибка'); } catch (_) {} }
 });
 
-// global error handling
 bot.catch((err, ctx) => {
   console.error(`Bot error for update ${ctx.update?.update_id}:`, err);
 });
 
-// graceful stop
 async function shutdown() {
-  try { await notifications.shutdown(bot); } catch (e) { console.error('notifications shutdown error', e); }
+  try { await notifications.shutdown(bot); } catch (e) {}
   try { await pool.end(); } catch (e) {}
   process.exit(0);
 }
 process.once('SIGINT', shutdown);
 process.once('SIGTERM', shutdown);
 
-// start notifications worker (hook)
 notifications.start(pool, bot);
 
-// webhook / startup
 (async () => {
   if (WEBHOOK_URL) {
     const app = express();
@@ -775,13 +733,10 @@ notifications.start(pool, bot);
     try {
       const setRes = await bot.telegram.setWebhook(`${WEBHOOK_URL}${hookPath}`);
       console.log('Webhook set result:', setRes);
-    } catch (e) {
-      console.error('Failed to set webhook:', e);
-    }
+    } catch (e) {}
     app.get('/', (req, res) => res.send('OK'));
     app.listen(PORT, () => console.log(`Express server listening on ${PORT}, webhook path ${hookPath}`));
   } else {
-    console.warn('WEBHOOK_URL / RENDER_EXTERNAL_URL not set — falling back to polling (for local dev).');
     await bot.launch();
   }
 })().catch(err => {
