@@ -1,9 +1,10 @@
-require('dotenv').config();
+const dotenv = require('dotenv');
+dotenv.config();
 
 const { Telegraf, Markup } = require('telegraf');
 const express = require('express');
 const { Pool } = require('pg');
-const { randomUUID } = require('crypto');
+const { randomUUID, createHash } = require('crypto');
 
 const utils = require('./utils/utils');
 const db = require('./utils/db');
@@ -60,6 +61,28 @@ const pool = new Pool({
 })();
 
 const adminStates = {};
+
+// --- HELPERS FOR SAFE CALLBACK KEYS ---
+function shortHash(s) {
+  return createHash('sha256').update(String(s)).digest('hex').slice(0, 8);
+}
+
+// Telegram limit: callback_data max 64 bytes
+function makeCallbackKey(prefix, key) {
+  const full = `${prefix}${key}`;
+  if (Buffer.byteLength(full, 'utf8') <= 64) return full;
+  return `${prefix}hash_${shortHash(key)}`;
+}
+
+// Resolve token like "hash_abcdef12" -> real procedure key by scanning DB
+async function resolveProcedureKeyMaybeHashed(pool, token) {
+  if (!token || !token.startsWith('hash_')) return token;
+  const wanted = token.slice(5);
+  const procs = await db.getProcedures(pool);
+  const found = procs.find(p => shortHash(p.key) === wanted);
+  return found ? found.key : null;
+}
+// ----------------------------------------
 
 bot.start(async ctx => {
   try {
@@ -123,7 +146,11 @@ bot.action(/req_([0-9a-fA-F\-]{36})/, async ctx => {
     adminStates[ctx.from.id].choosingSlotId = slotId;
 
     const procs = await db.getProcedures(pool);
-    const procButtons = procs.map(p => [Markup.button.callback(p.name, `proc_${slotId}_${p.key}`)]);
+    // build safe callback keys for procedures; if a procedure key is too long we will use hashed token
+    const procButtons = procs.map(p => {
+      const cb = makeCallbackKey(`proc_${slotId}_`, p.key);
+      return [Markup.button.callback(p.name, cb)];
+    });
     if (procButtons.length === 0) {
       await ctx.reply('Процедур пока нет. Попросите администратора добавить процедуру.');
     } else {
@@ -137,12 +164,19 @@ bot.action(/^proc_([0-9a-fA-F\-]{36})_(.+)$/u, async ctx => {
   try {
     if (await db.isUserBlacklisted(pool, ctx.from.username)) return ctx.answerCbQuery('Свободных интервалов пока нет.', { show_alert: true });
     const slotId = ctx.match[1];
-    const procKey = ctx.match[2];
+    let procKeyToken = ctx.match[2];
+
+    // If this token was a hashed token (hash_xxx), resolve to real key
+    if (procKeyToken && procKeyToken.startsWith('hash_')) {
+      const resolved = await resolveProcedureKeyMaybeHashed(pool, procKeyToken);
+      if (!resolved) return ctx.answerCbQuery('Процедура недоступна', { show_alert: true });
+      procKeyToken = resolved;
+    }
 
     const slot = await db.getSlotById(pool, slotId);
     if (!slot) return ctx.answerCbQuery('Слот стал недоступен', { show_alert: true });
 
-    const proc = await db.getProcedureByKey(pool, procKey);
+    const proc = await db.getProcedureByKey(pool, procKeyToken);
     if (!proc) return ctx.answerCbQuery('Процедура недоступна', { show_alert: true });
 
     const dup = await db.checkDuplicateRequest(pool, ctx.from.id, slotId);
@@ -204,8 +238,13 @@ bot.on('text', async ctx => {
     if (!st) return;
 
     if (st.mode === 'addproc') {
-      const rawKey = utils.slugifyName(text);
-      const key = rawKey || `proc_${randomUUID().slice(0,8)}`;
+      // Generate short unique key in format proc_<8hex>
+      let key;
+      // ensure uniqueness (very small loop because collisions are unlikely)
+      do {
+        key = `proc_${randomUUID().slice(0,8)}`;
+      } while (await db.getProcedureByKey(pool, key));
+
       try {
         await db.addProcedureDb(pool, key, text);
         delete adminStates[ctx.from.id];
@@ -213,7 +252,7 @@ bot.on('text', async ctx => {
       } catch (err) {
         delete adminStates[ctx.from.id];
         console.error('addProcedure error:', err);
-        return await ctx.reply('Не удалось добавить процедуру. Возможно, такой ключ уже существует.');
+        return await ctx.reply('Не удалось добавить процедуру. Возможно, произошла ошибка базы данных.');
       }
     }
 
@@ -490,7 +529,11 @@ bot.action('manage_procedures', async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
   try {
     const procs = await db.getProcedures(pool);
-    const buttons = procs.map(p => [Markup.button.callback(`Удалить ${utils.escapeHtml(p.name)}`, `delproc_${p.key}`)]);
+    const buttons = procs.map(p => {
+      // button text plain (no HTML entities), safe callback key
+      const cb = makeCallbackKey('delproc_', p.key);
+      return [Markup.button.callback(`Удалить ${p.name}`, cb)];
+    });
     buttons.push([Markup.button.callback('➕ Добавить процедуру', 'addproc')]);
     await ctx.reply('Список процедур:', Markup.inlineKeyboard(buttons));
     await ctx.answerCbQuery();
@@ -500,14 +543,22 @@ bot.action('manage_procedures', async ctx => {
 bot.action('addproc', async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
   adminStates[ctx.from.id] = { mode: 'addproc' };
-  await ctx.reply('Отправьте название процедуры (например: Ботулинотерапия). Я сгенерирую ключ автоматически.');
+  await ctx.reply('Отправьте название процедуры (например: Ботулинотерапия). Ключ будет сгенерирован автоматически (proc_<8hex>).');
   await ctx.answerCbQuery();
 });
 
 bot.action(/delproc_(.+)/, async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
   try {
-    const key = ctx.match[1];
+    let key = ctx.match[1];
+    if (key && key.startsWith('hash_')) {
+      const resolved = await resolveProcedureKeyMaybeHashed(pool, key);
+      if (!resolved) {
+        await ctx.answerCbQuery('Не удалось найти процедуру для удаления', { show_alert: true });
+        return;
+      }
+      key = resolved;
+    }
     await db.deleteProcedureDb(pool, key);
     await ctx.reply('Процедура удалена.');
     await ctx.answerCbQuery();
@@ -577,7 +628,7 @@ bot.action('manage_blacklist', async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
   try {
     const list = await db.getBlacklist(pool);
-    const buttons = list.map(u => [Markup.button.callback(`Удалить @${utils.escapeHtml(u)}`, `delblack_${u}`)]);
+    const buttons = list.map(u => [Markup.button.callback(`Удалить @${u}`, `delblack_${u}`)]);
     buttons.push([Markup.button.callback('➕ Добавить в ЧС', 'addblack')]);
     await ctx.reply('Черный список:', Markup.inlineKeyboard(buttons));
     await ctx.answerCbQuery();
