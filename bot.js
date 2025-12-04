@@ -584,6 +584,68 @@ bot.action('addpattern', async ctx => {
   await ctx.answerCbQuery();
 });
 
+// --- NEW: present 7 nearest dates as buttons for applying pattern ---
+function formatDateLabel(d) {
+  return `${String(d.getDate()).padStart(2,'0')}.${String(d.getMonth()+1).padStart(2,'0')}.${d.getFullYear()}`;
+}
+function isoDateYMD(d) {
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+bot.action('applypattern_start', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  try {
+    // Generate 7 dates starting from today
+    const buttons = [];
+    const today = new Date();
+    for (let i = 0; i < 7; i++) {
+      const dt = new Date(today.getFullYear(), today.getMonth(), today.getDate() + i);
+      const label = formatDateLabel(dt);
+      const iso = isoDateYMD(dt);
+      buttons.push([Markup.button.callback(label, `applypattern_pick_${iso}`)]);
+    }
+    // allow manual input as fallback
+    buttons.push([Markup.button.callback('Другие...', 'applypattern_manual')]);
+    adminStates[ctx.from.id] = { mode: 'applypattern_choosing' };
+    await ctx.reply('Выберите дату для применения шаблона:', Markup.inlineKeyboard(buttons));
+    await ctx.answerCbQuery();
+  } catch (e) {
+    console.error('applypattern_start error', e);
+    try { await ctx.answerCbQuery('Ошибка'); } catch (_) {}
+  }
+});
+
+bot.action('applypattern_manual', async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  adminStates[ctx.from.id] = { mode: 'applypattern_wait_date' };
+  await ctx.reply('Отправьте дату в формате DD.MM.YYYY для применения шаблона:');
+  await ctx.answerCbQuery();
+});
+
+bot.action(/^applypattern_pick_(\d{4}-\d{2}-\d{2})$/, async ctx => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
+  try {
+    const dateISO = ctx.match[1];
+    adminStates[ctx.from.id] = { mode: 'applypattern_choose', apply_date: dateISO };
+
+    const pats = await db.getPatternsDb(pool);
+    if (!pats || pats.length === 0) {
+      delete adminStates[ctx.from.id];
+      await ctx.reply('Шаблонов нет. Сначала добавьте шаблон.');
+      await ctx.answerCbQuery();
+      return;
+    }
+
+    const buttons = pats.map(p => [ Markup.button.callback(p.name + (p.intervals ? ` (${p.intervals})` : ''), `applypattern_date_${p.id}`) ]);
+    await ctx.reply('Выберите шаблон для применения на указанную дату:', Markup.inlineKeyboard(buttons));
+    await ctx.answerCbQuery();
+  } catch (e) {
+    console.error('applypattern_pick handler error', e);
+    try { await ctx.answerCbQuery('Ошибка'); } catch (_) {}
+  }
+});
+// --- end new date buttons flow ---
+
 bot.action(/^applypattern_date_(.+)$/, async ctx => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
   try {
@@ -602,13 +664,6 @@ bot.action(/^applypattern_date_(.+)$/, async ctx => {
     console.error('applypattern_date handler error', e);
     try { await ctx.answerCbQuery('Ошибка при применении шаблона'); } catch (_) {}
   }
-});
-
-bot.action('applypattern_start', async ctx => {
-  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет доступа');
-  adminStates[ctx.from.id] = { mode: 'applypattern_wait_date' };
-  await ctx.reply('Отправьте дату в формате DD.MM.YYYY для применения шаблона:');
-  await ctx.answerCbQuery();
 });
 
 bot.action(/delpattern_(.+)/, async ctx => {

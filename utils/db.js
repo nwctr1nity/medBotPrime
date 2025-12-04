@@ -299,8 +299,9 @@ async function applyClientMove(pool, reqId) {
 }
 
 async function getApprovedRequestsNeedingNotifications(pool) {
+  // Use COALESCE so that if the slot row was removed we still use original_slot_* saved in requests
   const rows = await pool.query(`
-    SELECT r.*, s.start as slot_start, s.time as slot_time
+    SELECT r.*, COALESCE(s.start, r.original_slot_start) AS slot_start, COALESCE(s.time, r.original_slot_time) AS slot_time
     FROM requests r
     LEFT JOIN slots s ON r.slot_id = s.id
     WHERE r.status = 'approved' AND (COALESCE(r.notification_20_sent,false) = false OR COALESCE(r.notification_1h_sent,false) = false)

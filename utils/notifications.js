@@ -22,9 +22,12 @@ function start(pool, bot) {
       const now = new Date();
 
       for (const r of rows) {
-        if (!r.slot_start) continue;
-        const slotStart = new Date(r.slot_start);
+        // slot_start may come from slots.start or original_slot_start (handled in db.getApprovedRequestsNeedingNotifications)
+        const slotStartIso = r.slot_start || r.original_slot_start || null;
+        if (!slotStartIso) continue;
+        const slotStart = new Date(slotStartIso);
 
+        // day before at 20:00 (local time)
         const dayBefore20 = new Date(slotStart);
         dayBefore20.setDate(dayBefore20.getDate() - 1);
         dayBefore20.setHours(20, 0, 0, 0);
@@ -33,7 +36,7 @@ function start(pool, bot) {
 
         if (!r.notification_20_sent && now >= dayBefore20) {
           try {
-            const slotDisplay = r.slot_time || formatSlotTimeDisplay(r.slot_start);
+            const slotDisplay = r.slot_time || formatSlotTimeDisplay(slotStartIso);
             await bot.telegram.sendMessage(r.user_id, `Напоминание: у вас запись на ${slotDisplay}.`);
             await db.updateRequest(pool, r.id, { notification_20_sent: true });
           } catch (e) {
@@ -43,7 +46,7 @@ function start(pool, bot) {
 
         if (!r.notification_1h_sent && now >= oneHourBefore) {
           try {
-            const slotDisplay = r.slot_time || formatSlotTimeDisplay(r.slot_start);
+            const slotDisplay = r.slot_time || formatSlotTimeDisplay(slotStartIso);
             await bot.telegram.sendMessage(r.user_id, `Через час у вас запись на ${slotDisplay}.`);
             await db.updateRequest(pool, r.id, { notification_1h_sent: true });
           } catch (e) {
@@ -54,8 +57,9 @@ function start(pool, bot) {
 
       const reserved = await db.getReservedRequests(pool);
       for (const r of reserved) {
-        if (!r.original_slot_start) continue;
-        const slotStart = new Date(r.original_slot_start);
+        const originalStartIso = r.original_slot_start;
+        if (!originalStartIso) continue;
+        const slotStart = new Date(originalStartIso);
         const cutoff = new Date(slotStart.getTime() - 3 * 60 * 60 * 1000);
         const now2 = new Date();
         const earlierSlotsRes = await pool.query('SELECT 1 FROM slots WHERE start < $1 LIMIT 1', [r.original_slot_start]);
